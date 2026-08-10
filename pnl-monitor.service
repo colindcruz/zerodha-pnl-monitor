@@ -1,0 +1,21 @@
+[Unit]
+Description=Zerodha Intraday P&L Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pnlmon
+WorkingDirectory=/opt/pnl-monitor
+ExecStart=/opt/pnl-monitor/venv/bin/python pnl_monitor.py
+Restart=on-failure
+RestartSec=30s
+# Give the script up to 90 s to shut down cleanly
+TimeoutStopSec=90
+
+# Tighten security surface
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
