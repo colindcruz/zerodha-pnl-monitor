@@ -279,6 +279,7 @@ def main():
     kws.connect(threaded=True)
 
     last_position_refresh = time.time()
+    last_trailing_heartbeat = 0
 
     try:
         while True:
@@ -333,6 +334,11 @@ def main():
                     f"vs floor Rs {tracker.trail_exit_level:,.2f}. EXIT NOW."
                 )
                 tracker.last_exit_alert = now
+
+            # ---- Trailing heartbeat: every 60 s once armed ----
+            if tracker.trail_armed and now - last_trailing_heartbeat >= 60:
+                send_telegram(format_summary(total_pnl, details))
+                last_trailing_heartbeat = now
 
             # ---- Milestone alerts (every Rs 5000 step, until trailing takes over) ----
             if not tracker.trail_armed:
