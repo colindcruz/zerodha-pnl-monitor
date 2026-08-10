@@ -241,7 +241,7 @@ def main():
         log.warning("No open positions found. The script will keep watching and "
                      "re-check positions periodically — open a trade and it'll pick it up.")
 
-    kws = KiteTicker(API_KEY, ACCESS_TOKEN)
+    kws = KiteTicker(API_KEY, access_token)
 
     def on_connect(ws, response):
         tokens = tracker.instrument_tokens()
