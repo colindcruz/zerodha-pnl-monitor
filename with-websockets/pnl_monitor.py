@@ -52,6 +52,9 @@ AUTO_EXIT               = os.getenv("AUTO_EXIT", "true").lower() == "true"
 HEDGE_PRICE_THRESHOLD   = float(os.getenv("HEDGE_PRICE_THRESHOLD", "5.0"))  # positions with LTP below this are kept
 EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait this long below floor before exiting
 
+# ---- Profit target exit ----
+PROFIT_TARGET           = float(os.getenv("PROFIT_TARGET", "80000"))  # exit all non-hedge positions when P&L hits this
+
 LOG_FILE = os.getenv("LOG_FILE", "pnl_monitor.log")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -182,8 +185,9 @@ class PositionTracker:
         self.trail_exit_level = None
         self.trail_breached = False
         self.last_exit_alert = 0
-        self.breach_since = None    # timestamp when breach started
-        self.auto_exited = False    # only fire auto-exit once per breach
+        self.breach_since = None       # timestamp when breach started
+        self.auto_exited = False       # only fire auto-exit once per breach
+        self.profit_target_hit = False # only fire profit target exit once
 
         self.refresh_positions()
 
@@ -435,6 +439,29 @@ def main():
                 except Exception as exc:
                     log.error("Auto-exit failed: %s", exc)
                     notify("🔴 Auto-exit ERROR", str(exc), priority="urgent")
+
+            # ---- Profit target exit ----
+            if (not tracker.profit_target_hit
+                    and total_pnl >= PROFIT_TARGET):
+                tracker.profit_target_hit = True
+                log.info("Profit target Rs %.0f hit — auto-exiting.", PROFIT_TARGET)
+                try:
+                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    lines = []
+                    if exited:
+                        lines.append(f"Exited: {', '.join(exited)}")
+                    if skipped:
+                        lines.append(f"Kept (hedge): {', '.join(skipped)}")
+                    if failed:
+                        lines.append(f"FAILED: {', '.join(failed)}")
+                    notify(
+                        f"🎯 Profit target Rs {PROFIT_TARGET:,.0f} hit — exited",
+                        "\n".join(lines) if lines else "No positions to exit.",
+                        priority="high",
+                    )
+                except Exception as exc:
+                    log.error("Profit target exit failed: %s", exc)
+                    notify("🎯 Profit target exit ERROR", str(exc), priority="urgent")
 
             # ---- Trailing heartbeat: every 60 s once armed ----
             if tracker.trail_armed and now - last_trailing_heartbeat >= 60:
