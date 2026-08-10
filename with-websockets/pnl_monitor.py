@@ -47,6 +47,11 @@ TRAIL_PERCENT               = float(os.getenv("TRAIL_PERCENT", "20"))
 EXIT_ALERT_REPEAT_SECONDS   = int(os.getenv("EXIT_ALERT_REPEAT_SECONDS", "15"))
 TRAIL_CHECK_INTERVAL        = int(os.getenv("TRAIL_CHECK_INTERVAL", "1"))
 
+# ---- Auto-exit on trailing breach ----
+AUTO_EXIT               = os.getenv("AUTO_EXIT", "true").lower() == "true"
+HEDGE_PRICE_THRESHOLD   = float(os.getenv("HEDGE_PRICE_THRESHOLD", "5.0"))  # positions with LTP below this are kept
+EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait this long below floor before exiting
+
 LOG_FILE = os.getenv("LOG_FILE", "pnl_monitor.log")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -118,6 +123,47 @@ def notify(title: str, body: str, priority: str = "default"):
     send_ntfy(title, body, priority)
 
 
+# ---- Auto-exit helper ----
+
+def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list]:
+    """
+    Market-exit all open positions with LTP >= HEDGE_PRICE_THRESHOLD.
+    Exits sold legs (short) first, then bought legs (long).
+    Returns (exited_symbols, skipped_symbols).
+    """
+    data = kite.positions()
+    net = [p for p in data.get("net", []) if p["quantity"] != 0]
+
+    sold_legs  = [p for p in net if p["quantity"] < 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
+    bought_legs = [p for p in net if p["quantity"] > 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
+    hedges     = [p for p in net if p["last_price"] < HEDGE_PRICE_THRESHOLD]
+
+    exited, failed = [], []
+
+    for pos in sold_legs + bought_legs:
+        symbol = pos["tradingsymbol"]
+        qty    = pos["quantity"]
+        tx     = kite.TRANSACTION_TYPE_BUY if qty < 0 else kite.TRANSACTION_TYPE_SELL
+        try:
+            kite.place_order(
+                variety=kite.VARIETY_REGULAR,
+                exchange=pos["exchange"],
+                tradingsymbol=symbol,
+                transaction_type=tx,
+                quantity=abs(qty),
+                product=pos["product"],
+                order_type=kite.ORDER_TYPE_MARKET,
+            )
+            log.info("Exit order placed: %s qty=%d", symbol, qty)
+            exited.append(symbol)
+        except Exception as exc:
+            log.error("Failed to exit %s: %s", symbol, exc)
+            failed.append(f"{symbol} (ERROR: {exc})")
+
+    skipped = [p["tradingsymbol"] for p in hedges]
+    return exited, skipped, failed
+
+
 # ---- Position tracking ----
 
 class PositionTracker:
@@ -136,6 +182,8 @@ class PositionTracker:
         self.trail_exit_level = None
         self.trail_breached = False
         self.last_exit_alert = 0
+        self.breach_since = None    # timestamp when breach started
+        self.auto_exited = False    # only fire auto-exit once per breach
 
         self.refresh_positions()
 
@@ -336,13 +384,18 @@ def main():
                     f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f}",
                 )
             elif event == "breach":
+                tracker.breach_since = now
+                tracker.auto_exited = False
+                buffer_msg = f"Exiting in {EXIT_BUFFER_SECONDS}s if not recovered." if AUTO_EXIT else ""
                 notify(
-                    "🚨 EXIT NOW",
-                    f"P&L Rs {total_pnl:,.2f} hit exit floor Rs {tracker.trail_exit_level:,.2f}\nCLOSE THE POSITION.",
+                    "🚨 Trailing floor breached",
+                    f"P&L Rs {total_pnl:,.2f} hit floor Rs {tracker.trail_exit_level:,.2f}\n{buffer_msg}",
                     priority="urgent",
                 )
                 tracker.last_exit_alert = now
             elif event == "recovered":
+                tracker.breach_since = None
+                tracker.auto_exited = False
                 notify(
                     "✅ Back above exit floor",
                     f"P&L Rs {total_pnl:,.2f} (floor Rs {tracker.trail_exit_level:,.2f})",
@@ -350,12 +403,38 @@ def main():
 
             # Repeat the EXIT NOW alert while still breached, so it can't be missed
             if tracker.trail_breached and now - tracker.last_exit_alert >= EXIT_ALERT_REPEAT_SECONDS:
+                seconds_left = max(0, EXIT_BUFFER_SECONDS - int(now - (tracker.breach_since or now)))
+                msg = (f"Auto-exiting in {seconds_left}s..." if AUTO_EXIT and seconds_left > 0
+                       else "Positions being exited." if AUTO_EXIT
+                       else "EXIT NOW.")
                 notify(
                     "🚨 Still below exit floor",
-                    f"P&L Rs {total_pnl:,.2f} vs floor Rs {tracker.trail_exit_level:,.2f}. EXIT NOW.",
+                    f"P&L Rs {total_pnl:,.2f} vs floor Rs {tracker.trail_exit_level:,.2f}. {msg}",
                     priority="urgent",
                 )
                 tracker.last_exit_alert = now
+
+            # ---- Auto-exit after buffer period ----
+            if (AUTO_EXIT
+                    and tracker.trail_breached
+                    and not tracker.auto_exited
+                    and tracker.breach_since is not None
+                    and now - tracker.breach_since >= EXIT_BUFFER_SECONDS):
+                tracker.auto_exited = True
+                log.info("Auto-exit triggered after %ds breach.", EXIT_BUFFER_SECONDS)
+                try:
+                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    lines = ["🔴 AUTO-EXIT EXECUTED"]
+                    if exited:
+                        lines.append(f"Exited: {', '.join(exited)}")
+                    if skipped:
+                        lines.append(f"Kept (hedge): {', '.join(skipped)}")
+                    if failed:
+                        lines.append(f"FAILED: {', '.join(failed)}")
+                    notify("🔴 Auto-exit executed", "\n".join(lines[1:]), priority="urgent")
+                except Exception as exc:
+                    log.error("Auto-exit failed: %s", exc)
+                    notify("🔴 Auto-exit ERROR", str(exc), priority="urgent")
 
             # ---- Trailing heartbeat: every 60 s once armed ----
             if tracker.trail_armed and now - last_trailing_heartbeat >= 60:
