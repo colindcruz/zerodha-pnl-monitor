@@ -2,18 +2,17 @@
 Real-time P&L Monitor for Zerodha Kite positions
 ==================================================
 
-What it does:
-- Connects to Kite's WebSocket ticker (KiteTicker) for live tick-by-tick prices
-- Auto-detects all your open positions via kite.positions()
-- Computes running P&L on every tick using live LTP
-- Sends Telegram alerts:
-    1. A periodic summary every PERIODIC_INTERVAL_SECONDS
-    2. An immediate alert whenever total P&L crosses PROFIT_THRESHOLD or LOSS_THRESHOLD
+Alert logic:
+- Sends a full P&L update every time total P&L crosses a MILESTONE_STEP boundary
+  (e.g. every Rs 5000: ...-10k, -5k, 0, 5k, 10k ... 35k, 40k).
+- Once P&L reaches TRAIL_ACTIVATION_THRESHOLD, milestone alerts stop and the
+  trailing profit-lock takes over.
 
 Secrets are loaded from a .env file (see .env.example).
 Run generate_token.py each morning to refresh the daily access token.
 """
 
+import math
 import os
 import time
 import logging
@@ -38,10 +37,7 @@ ACCESS_TOKEN_PATH   = Path(os.getenv("ACCESS_TOKEN_PATH", ".access_token"))
 TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]
 
-PERIODIC_INTERVAL_SECONDS   = int(os.getenv("PERIODIC_INTERVAL_SECONDS", "30"))
-PROFIT_THRESHOLD             = float(os.getenv("PROFIT_THRESHOLD", "5000"))
-LOSS_THRESHOLD               = float(os.getenv("LOSS_THRESHOLD", "-5000"))
-THRESHOLD_COOLDOWN_SECONDS   = int(os.getenv("THRESHOLD_COOLDOWN_SECONDS", "300"))
+MILESTONE_STEP              = float(os.getenv("MILESTONE_STEP", "5000"))
 
 # ---- Trailing profit-lock ----
 TRAIL_ACTIVATION_THRESHOLD  = float(os.getenv("TRAIL_ACTIVATION_THRESHOLD", "40000"))
@@ -108,7 +104,7 @@ class PositionTracker:
         self.lock = threading.Lock()
         self.positions = {}       # instrument_token -> position dict
         self.ltp = {}             # instrument_token -> last traded price
-        self.last_threshold_fire = {"profit": 0, "loss": 0}
+        self.last_milestone = None  # last Rs 5000 bucket that triggered an alert
 
         # Trailing profit-lock state
         self.trail_armed = False
@@ -282,7 +278,6 @@ def main():
     # Run the ticker in a background thread so we can run our own alert loop here
     kws.connect(threaded=True)
 
-    last_periodic = 0
     last_position_refresh = time.time()
 
     try:
@@ -339,20 +334,12 @@ def main():
                 )
                 tracker.last_exit_alert = now
 
-            # ---- Routine heartbeat summary ----
-            if now - last_periodic >= PERIODIC_INTERVAL_SECONDS:
-                if details:
+            # ---- Milestone alerts (every Rs 5000 step, until trailing takes over) ----
+            if not tracker.trail_armed:
+                milestone = math.floor(total_pnl / MILESTONE_STEP) * MILESTONE_STEP
+                if milestone != tracker.last_milestone:
+                    tracker.last_milestone = milestone
                     send_telegram(format_summary(total_pnl, details))
-                last_periodic = now
-
-            # ---- Optional simple one-shot thresholds (independent of trailing) ----
-            if total_pnl >= PROFIT_THRESHOLD and now - tracker.last_threshold_fire["profit"] > THRESHOLD_COOLDOWN_SECONDS:
-                send_telegram(f"🟢 PROFIT THRESHOLD HIT\nTotal P&L: Rs {total_pnl:,.2f}")
-                tracker.last_threshold_fire["profit"] = now
-
-            if total_pnl <= LOSS_THRESHOLD and now - tracker.last_threshold_fire["loss"] > THRESHOLD_COOLDOWN_SECONDS:
-                send_telegram(f"🔴 LOSS THRESHOLD HIT\nTotal P&L: Rs {total_pnl:,.2f}")
-                tracker.last_threshold_fire["loss"] = now
 
             time.sleep(TRAIL_CHECK_INTERVAL)
 
