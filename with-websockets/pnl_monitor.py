@@ -37,6 +37,8 @@ ACCESS_TOKEN_PATH   = Path(os.getenv("ACCESS_TOKEN_PATH", ".access_token"))
 TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]
 
+NTFY_TOPIC          = os.getenv("NTFY_TOPIC", "")  # e.g. colin-pnl-xyz123
+
 MILESTONE_STEP              = float(os.getenv("MILESTONE_STEP", "5000"))
 
 # ---- Trailing profit-lock ----
@@ -82,7 +84,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("pnl_monitor")
 
-# ---- Telegram helper ----
+# ---- Notification helpers ----
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -92,6 +94,28 @@ def send_telegram(text: str):
             log.error(f"Telegram send failed: {resp.status_code} {resp.text}")
     except Exception as e:
         log.error(f"Telegram send error: {e}")
+
+
+def send_ntfy(title: str, body: str, priority: str = "default"):
+    if not NTFY_TOPIC:
+        return
+    try:
+        resp = requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=body.encode(),
+            headers={"Title": title, "Priority": priority},
+            timeout=10,
+        )
+        if not resp.ok:
+            log.error(f"ntfy send failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        log.error(f"ntfy send error: {e}")
+
+
+def notify(title: str, body: str, priority: str = "default"):
+    """Send to both Telegram and ntfy."""
+    send_telegram(f"{title}\n{body}" if title else body)
+    send_ntfy(title, body, priority)
 
 
 # ---- Position tracking ----
@@ -225,7 +249,7 @@ def main():
         access_token = _read_access_token()
     except RuntimeError as exc:
         log.error(str(exc))
-        send_telegram(f"🔑 {exc}\nRun generate_token.py and restart the service.")
+        notify("🔑 Access token error", f"{exc}\nRun generate_token.py and restart the service.", priority="high")
         return
 
     kite = KiteConnect(api_key=API_KEY)
@@ -246,10 +270,9 @@ def main():
             ws.set_mode(ws.MODE_FULL, tokens)
         log.info(f"WebSocket connected. Subscribed to {len(tokens)} instruments.")
         total_pnl, _ = tracker.compute_pnl()
-        send_telegram(
-            f"📡 P&L Monitor started\n"
-            f"Watching {len(tokens)} open position(s)\n"
-            f"Current P&L: Rs {total_pnl:,.2f}"
+        notify(
+            "📡 P&L Monitor started",
+            f"Watching {len(tokens)} open position(s)\nCurrent P&L: Rs {total_pnl:,.2f}",
         )
 
     def on_ticks(ws, ticks):
@@ -266,7 +289,7 @@ def main():
 
     def on_noreconnect(ws):
         log.error("WebSocket gave up reconnecting.")
-        send_telegram("P&L Monitor: WebSocket connection lost and could not reconnect. Please check the server.")
+        notify("⚠️ Connection lost", "WebSocket could not reconnect. Please check the server.", priority="high")
 
     kws.on_connect = on_connect
     kws.on_ticks = on_ticks
@@ -302,42 +325,41 @@ def main():
             event = tracker.update_trailing_stop(total_pnl)
 
             if event == "armed":
-                send_telegram(
-                    f"🔒 TRAILING LOCK ARMED\n"
-                    f"P&L hit Rs {total_pnl:,.2f} (threshold Rs {TRAIL_ACTIVATION_THRESHOLD:,.0f}).\n"
-                    f"Exit floor set at Rs {tracker.trail_exit_level:,.2f} "
-                    f"({TRAIL_PERCENT}% trail from peak)."
+                notify(
+                    "🔒 Trailing lock armed",
+                    f"P&L hit Rs {total_pnl:,.2f}\nExit floor: Rs {tracker.trail_exit_level:,.2f} ({TRAIL_PERCENT}% trail)",
+                    priority="high",
                 )
             elif event == "new_peak":
-                send_telegram(
-                    f"📈 NEW PEAK: Rs {tracker.trail_peak:,.2f}\n"
-                    f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f}"
+                notify(
+                    f"📈 New peak: Rs {tracker.trail_peak:,.2f}",
+                    f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f}",
                 )
             elif event == "breach":
-                send_telegram(
-                    f"🚨🚨 EXIT NOW 🚨🚨\n"
-                    f"P&L Rs {total_pnl:,.2f} has dropped to/below your trailing exit floor "
-                    f"of Rs {tracker.trail_exit_level:,.2f} (peak was Rs {tracker.trail_peak:,.2f}).\n"
-                    f"CLOSE THE POSITION."
+                notify(
+                    "🚨 EXIT NOW",
+                    f"P&L Rs {total_pnl:,.2f} hit exit floor Rs {tracker.trail_exit_level:,.2f}\nCLOSE THE POSITION.",
+                    priority="urgent",
                 )
                 tracker.last_exit_alert = now
             elif event == "recovered":
-                send_telegram(
-                    f"✅ Back above exit floor. P&L Rs {total_pnl:,.2f} "
-                    f"(floor Rs {tracker.trail_exit_level:,.2f})"
+                notify(
+                    "✅ Back above exit floor",
+                    f"P&L Rs {total_pnl:,.2f} (floor Rs {tracker.trail_exit_level:,.2f})",
                 )
 
             # Repeat the EXIT NOW alert while still breached, so it can't be missed
             if tracker.trail_breached and now - tracker.last_exit_alert >= EXIT_ALERT_REPEAT_SECONDS:
-                send_telegram(
-                    f"🚨 STILL BELOW EXIT FLOOR — P&L Rs {total_pnl:,.2f} "
-                    f"vs floor Rs {tracker.trail_exit_level:,.2f}. EXIT NOW."
+                notify(
+                    "🚨 Still below exit floor",
+                    f"P&L Rs {total_pnl:,.2f} vs floor Rs {tracker.trail_exit_level:,.2f}. EXIT NOW.",
+                    priority="urgent",
                 )
                 tracker.last_exit_alert = now
 
             # ---- Trailing heartbeat: every 60 s once armed ----
             if tracker.trail_armed and now - last_trailing_heartbeat >= 60:
-                send_telegram(format_summary(total_pnl, details))
+                notify("📊 P&L Update", format_summary(total_pnl, details))
                 last_trailing_heartbeat = now
 
             # ---- Milestone alerts (every Rs 5000 step, until trailing takes over) ----
@@ -345,7 +367,7 @@ def main():
                 milestone = math.floor(total_pnl / MILESTONE_STEP) * MILESTONE_STEP
                 if milestone != tracker.last_milestone:
                     tracker.last_milestone = milestone
-                    send_telegram(format_summary(total_pnl, details))
+                    notify("📊 P&L Milestone", format_summary(total_pnl, details))
 
             time.sleep(TRAIL_CHECK_INTERVAL)
 
