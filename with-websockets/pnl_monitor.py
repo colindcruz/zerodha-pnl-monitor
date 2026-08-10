@@ -249,7 +249,12 @@ def main():
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
         log.info(f"WebSocket connected. Subscribed to {len(tokens)} instruments.")
-        send_telegram(f"P&L Monitor started. Watching {len(tokens)} open position(s).")
+        total_pnl, _ = tracker.compute_pnl()
+        send_telegram(
+            f"📡 P&L Monitor started\n"
+            f"Watching {len(tokens)} open position(s)\n"
+            f"Current P&L: Rs {total_pnl:,.2f}"
+        )
 
     def on_ticks(ws, ticks):
         tracker.update_ticks(ticks)
