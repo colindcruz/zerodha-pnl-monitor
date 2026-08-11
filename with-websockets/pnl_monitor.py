@@ -129,40 +129,89 @@ def notify(title: str, body: str, priority: str = "default"):
 
 # ---- Auto-exit helper ----
 
-def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list]:
+FREEZE_QTY_LIMIT = 1800  # NSE exchange freeze quantity per order for F&O
+
+def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
+    """Fetch lot sizes for a list of NFO tradingsymbols."""
+    try:
+        instruments = kite.instruments("NFO")
+        return {i["tradingsymbol"]: int(i["lot_size"]) for i in instruments if i["tradingsymbol"] in symbols}
+    except Exception as exc:
+        log.warning("Could not fetch lot sizes: %s — defaulting to 1", exc)
+        return {}
+
+
+def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list, list]:
     """
-    Market-exit all open positions with LTP >= HEDGE_PRICE_THRESHOLD.
+    Limit-exit all open positions with LTP >= HEDGE_PRICE_THRESHOLD.
     Exits sold legs (short) first, then bought legs (long).
-    Returns (exited_symbols, skipped_symbols).
+    Splits large orders into chunks to stay within exchange freeze limits.
+    Returns (exited_symbols, skipped_symbols, failed_symbols).
     """
     data = kite.positions()
     net = [p for p in data.get("net", []) if p["quantity"] != 0]
 
-    sold_legs  = [p for p in net if p["quantity"] < 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
+    sold_legs   = [p for p in net if p["quantity"] < 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
     bought_legs = [p for p in net if p["quantity"] > 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
-    hedges     = [p for p in net if p["last_price"] < HEDGE_PRICE_THRESHOLD]
+    hedges      = [p for p in net if p["last_price"] < HEDGE_PRICE_THRESHOLD]
+
+    to_exit = sold_legs + bought_legs
+    if not to_exit:
+        return [], [p["tradingsymbol"] for p in hedges], []
+
+    # Fetch live LTPs for limit price calculation
+    exchange_symbols = [f"{p['exchange']}:{p['tradingsymbol']}" for p in to_exit]
+    try:
+        ltp_data = kite.ltp(exchange_symbols)
+    except Exception as exc:
+        log.warning("LTP fetch failed, using last_price: %s", exc)
+        ltp_data = {}
+
+    # Fetch lot sizes for splitting
+    symbols = [p["tradingsymbol"] for p in to_exit]
+    lot_sizes = _get_lot_sizes(kite, symbols)
 
     exited, failed = [], []
 
-    for pos in sold_legs + bought_legs:
-        symbol = pos["tradingsymbol"]
-        qty    = pos["quantity"]
-        tx     = kite.TRANSACTION_TYPE_BUY if qty < 0 else kite.TRANSACTION_TYPE_SELL
-        try:
-            kite.place_order(
-                variety=kite.VARIETY_REGULAR,
-                exchange=pos["exchange"],
-                tradingsymbol=symbol,
-                transaction_type=tx,
-                quantity=abs(qty),
-                product=pos["product"],
-                order_type=kite.ORDER_TYPE_MARKET,
-            )
-            log.info("Exit order placed: %s qty=%d", symbol, qty)
+    for pos in to_exit:
+        symbol  = pos["tradingsymbol"]
+        qty     = pos["quantity"]
+        tx      = kite.TRANSACTION_TYPE_BUY if qty < 0 else kite.TRANSACTION_TYPE_SELL
+
+        # Aggressive limit price — slightly through LTP for fast fill
+        key = f"{pos['exchange']}:{symbol}"
+        ltp = ltp_data.get(key, {}).get("last_price", pos["last_price"])
+        limit_price = round(ltp - 0.5 if tx == kite.TRANSACTION_TYPE_SELL else ltp + 0.5, 1)
+
+        # Split into chunks within freeze limit
+        lot_size  = lot_sizes.get(symbol, 1)
+        max_chunk = (FREEZE_QTY_LIMIT // lot_size) * lot_size if lot_size > 1 else FREEZE_QTY_LIMIT
+        remaining = abs(qty)
+        success   = True
+
+        while remaining > 0:
+            chunk = min(remaining, max_chunk)
+            try:
+                order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=pos["exchange"],
+                    tradingsymbol=symbol,
+                    transaction_type=tx,
+                    quantity=chunk,
+                    product=pos["product"],
+                    order_type=kite.ORDER_TYPE_LIMIT,
+                    price=limit_price,
+                )
+                log.info("Exit order: %s %s qty=%d @ %.1f order_id=%s", tx, symbol, chunk, limit_price, order_id)
+                remaining -= chunk
+            except Exception as exc:
+                log.error("Failed to exit %s qty=%d: %s", symbol, chunk, exc)
+                failed.append(f"{symbol} (ERROR: {exc})")
+                success = False
+                break
+
+        if success:
             exited.append(symbol)
-        except Exception as exc:
-            log.error("Failed to exit %s: %s", symbol, exc)
-            failed.append(f"{symbol} (ERROR: {exc})")
 
     skipped = [p["tradingsymbol"] for p in hedges]
     return exited, skipped, failed
