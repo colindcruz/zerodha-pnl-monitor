@@ -178,10 +178,11 @@ def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list, list]:
         qty     = pos["quantity"]
         tx      = kite.TRANSACTION_TYPE_BUY if qty < 0 else kite.TRANSACTION_TYPE_SELL
 
-        # Aggressive limit price — slightly through LTP for fast fill
+        # Aggressive limit price — 1% of LTP, minimum Rs 1, for fast fill
         key = f"{pos['exchange']}:{symbol}"
         ltp = ltp_data.get(key, {}).get("last_price", pos["last_price"])
-        limit_price = round(ltp - 0.5 if tx == kite.TRANSACTION_TYPE_SELL else ltp + 0.5, 1)
+        buffer = max(1.0, round(ltp * 0.01, 1))
+        limit_price = round(ltp - buffer if tx == kite.TRANSACTION_TYPE_SELL else ltp + buffer, 1)
 
         # Split into chunks within freeze limit
         lot_size  = lot_sizes.get(symbol, 1)
