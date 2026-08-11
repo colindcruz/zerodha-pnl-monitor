@@ -227,20 +227,23 @@ class PositionTracker:
         per_position_list: list of dicts with tradingsymbol, quantity, avg_price, ltp, pnl
         """
         with self.lock:
-            total = self.realized_pnl  # start with realized P&L from closed positions
+            total = self.realized_pnl  # start with realized P&L from fully closed positions
             details = []
             for token, pos in self.positions.items():
                 qty = pos["quantity"]
                 avg_price = pos["average_price"]
-                ltp = self.ltp.get(token, pos.get("last_price", avg_price))
-                multiplier = pos.get("multiplier", 1) or 1
-                pnl = (ltp - avg_price) * qty * multiplier
+                live_ltp = self.ltp.get(token, pos.get("last_price", avg_price))
+                kite_ltp = pos.get("last_price", avg_price)
+                kite_pnl = float(pos.get("pnl", 0))
+                # Use Kite's P&L as base (handles partial closes correctly)
+                # then add live tick movement since last REST refresh
+                pnl = kite_pnl + (live_ltp - kite_ltp) * qty
                 total += pnl
                 details.append({
                     "symbol": pos["tradingsymbol"],
                     "qty": qty,
                     "avg_price": avg_price,
-                    "ltp": ltp,
+                    "ltp": live_ltp,
                     "pnl": pnl,
                 })
             return total, details
