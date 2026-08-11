@@ -178,7 +178,9 @@ class PositionTracker:
         self.lock = threading.Lock()
         self.positions = {}       # instrument_token -> position dict
         self.ltp = {}             # instrument_token -> last traded price
-        self.last_milestone = None  # last Rs 5000 bucket that triggered an alert
+        self.realized_pnl = 0.0          # realized P&L from positions closed earlier today
+        self.last_milestone = None       # last Rs 5000 bucket that triggered an alert
+        self.last_milestone_alert = 0.0  # timestamp of last milestone alert (cooldown)
 
         # Trailing profit-lock state
         self.trail_armed = False
@@ -202,7 +204,11 @@ class PositionTracker:
                 self.positions = {
                     p["instrument_token"]: p for p in net if p["quantity"] != 0
                 }
-            log.info(f"Refreshed positions: {len(self.positions)} open")
+                # Realized P&L from positions closed earlier today
+                self.realized_pnl = sum(
+                    float(p.get("pnl", 0)) for p in net if p["quantity"] == 0
+                )
+            log.info(f"Refreshed positions: {len(self.positions)} open, realized P&L: {self.realized_pnl:.2f}")
         except Exception as e:
             log.error(f"Failed to refresh positions: {e}")
 
@@ -221,7 +227,7 @@ class PositionTracker:
         per_position_list: list of dicts with tradingsymbol, quantity, avg_price, ltp, pnl
         """
         with self.lock:
-            total = 0.0
+            total = self.realized_pnl  # start with realized P&L from closed positions
             details = []
             for token, pos in self.positions.items():
                 qty = pos["quantity"]
@@ -496,8 +502,10 @@ def main():
             # ---- Milestone alerts (every Rs 5000 step, until trailing takes over) ----
             if not tracker.trail_armed:
                 milestone = math.floor(total_pnl / MILESTONE_STEP) * MILESTONE_STEP
-                if milestone != tracker.last_milestone:
+                if (milestone != tracker.last_milestone
+                        and now - tracker.last_milestone_alert >= 60):
                     tracker.last_milestone = milestone
+                    tracker.last_milestone_alert = now
                     notify("📊 P&L Milestone", format_summary(total_pnl, details))
 
             time.sleep(TRAIL_CHECK_INTERVAL)
