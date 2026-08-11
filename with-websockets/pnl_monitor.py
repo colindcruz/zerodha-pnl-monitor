@@ -77,6 +77,9 @@ LOSS_WARNING_1          = float(os.getenv("LOSS_WARNING_1", "-20000"))  # warnin
 LOSS_WARNING_2          = float(os.getenv("LOSS_WARNING_2", "-30000"))  # cut position size alert
 LOSS_LIMIT              = float(os.getenv("LOSS_LIMIT", "-40000"))      # hard shutdown — exit all
 
+# ---- Position size limit ----
+MAX_POSITION_QTY        = int(os.getenv("MAX_POSITION_QTY", "1950"))    # max qty per individual non-hedge position
+
 LOG_FILE = os.getenv("LOG_FILE", "pnl_monitor.log")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -299,6 +302,10 @@ class PositionTracker:
         self.green_day_armed = False    # True once P&L hits GREEN_DAY_ACTIVATION
         self.green_day_exited = False   # only fire once
 
+        # Position size limit state
+        self.oversize_since = {}        # symbol -> timestamp when it first exceeded MAX_POSITION_QTY
+        self.last_oversize_alert = 0.0  # timestamp of last oversize alert (60s cooldown)
+
         self.refresh_positions()
 
     def refresh_positions(self):
@@ -489,6 +496,33 @@ def main():
                 last_position_refresh = now
 
             total_pnl, details = tracker.compute_pnl()
+
+            # ---- Position size limit check ----
+            breaching = [
+                d for d in details
+                if abs(d["qty"]) > MAX_POSITION_QTY and d["ltp"] >= HEDGE_PRICE_THRESHOLD
+            ]
+            # Track when each symbol first breached
+            breaching_symbols = {d["symbol"] for d in breaching}
+            for d in breaching:
+                if d["symbol"] not in tracker.oversize_since:
+                    tracker.oversize_since[d["symbol"]] = now
+            # Clear symbols that are no longer breaching
+            for sym in list(tracker.oversize_since):
+                if sym not in breaching_symbols:
+                    del tracker.oversize_since[sym]
+            # Alert every 60s while any position is breaching
+            if breaching and now - tracker.last_oversize_alert >= 60:
+                tracker.last_oversize_alert = now
+                lines = []
+                for d in breaching:
+                    elapsed = int((now - tracker.oversize_since[d["symbol"]]) / 60)
+                    lines.append(f"{d['symbol']}: qty {abs(d['qty'])} — {elapsed} min exceeded")
+                notify(
+                    f"⚠️ Max lot size exceeded (limit: {MAX_POSITION_QTY})",
+                    "\n".join(lines),
+                    priority="high",
+                )
 
             # ---- Trailing profit-lock (the important one) ----
             event = tracker.update_trailing_stop(total_pnl)
