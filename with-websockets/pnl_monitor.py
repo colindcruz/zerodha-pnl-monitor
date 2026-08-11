@@ -43,7 +43,20 @@ MILESTONE_STEP              = float(os.getenv("MILESTONE_STEP", "5000"))
 
 # ---- Trailing profit-lock ----
 TRAIL_ACTIVATION_THRESHOLD  = float(os.getenv("TRAIL_ACTIVATION_THRESHOLD", "40000"))
-TRAIL_PERCENT               = float(os.getenv("TRAIL_PERCENT", "20"))
+
+# Tiered drawdown: (min_peak, drawdown_amount) — sorted highest first
+TRAIL_TIERS = [
+    (100_000, 15_000),  # above ₹1L   → ₹15k drawdown
+    ( 80_000, 12_000),  # ₹80k–₹1L   → ₹12k drawdown
+    ( 60_000, 10_000),  # ₹60k–₹80k  → ₹10k drawdown
+    ( 40_000,  8_000),  # ₹40k–₹60k  → ₹8k drawdown
+]
+
+def _trail_drawdown(peak: float) -> float:
+    for threshold, drawdown in TRAIL_TIERS:
+        if peak >= threshold:
+            return drawdown
+    return 8_000  # fallback
 EXIT_ALERT_REPEAT_SECONDS   = int(os.getenv("EXIT_ALERT_REPEAT_SECONDS", "15"))
 TRAIL_CHECK_INTERVAL        = int(os.getenv("TRAIL_CHECK_INTERVAL", "1"))
 
@@ -341,14 +354,14 @@ class PositionTracker:
             if total_pnl >= TRAIL_ACTIVATION_THRESHOLD:
                 self.trail_armed = True
                 self.trail_peak = total_pnl
-                self.trail_exit_level = self.trail_peak * (1 - TRAIL_PERCENT / 100)
+                self.trail_exit_level = self.trail_peak - _trail_drawdown(self.trail_peak)
                 event = "armed"
             return event
 
         # Already armed — track new peaks
         if total_pnl > self.trail_peak:
             self.trail_peak = total_pnl
-            new_exit_level = self.trail_peak * (1 - TRAIL_PERCENT / 100)
+            new_exit_level = self.trail_peak - _trail_drawdown(self.trail_peak)
             if self.trail_exit_level is None or new_exit_level > self.trail_exit_level:
                 self.trail_exit_level = new_exit_level
                 if not self.trail_breached:
@@ -465,15 +478,17 @@ def main():
             event = tracker.update_trailing_stop(total_pnl)
 
             if event == "armed":
+                drawdown = _trail_drawdown(tracker.trail_peak)
                 notify(
                     "🔒 Trailing lock armed",
-                    f"P&L hit Rs {total_pnl:,.2f}\nExit floor: Rs {tracker.trail_exit_level:,.2f} ({TRAIL_PERCENT}% trail)",
+                    f"P&L hit Rs {total_pnl:,.2f}\nExit floor: Rs {tracker.trail_exit_level:,.2f} (Rs {drawdown:,.0f} drawdown)",
                     priority="high",
                 )
             elif event == "new_peak":
+                drawdown = _trail_drawdown(tracker.trail_peak)
                 notify(
                     f"📈 New peak: Rs {tracker.trail_peak:,.2f}",
-                    f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f}",
+                    f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f} (Rs {drawdown:,.0f} drawdown)",
                 )
             elif event == "breach":
                 tracker.breach_since = now
