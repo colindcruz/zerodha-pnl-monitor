@@ -286,8 +286,10 @@ class PositionTracker:
         self.trail_exit_level = None
         self.trail_breached = False
         self.last_exit_alert = 0
-        self.breach_since = None       # timestamp when breach started
-        self.auto_exited = False       # only fire auto-exit once per breach
+        self.breach_since = None        # timestamp when breach started
+        self.auto_exited = False        # only fire auto-exit once per breach
+        self.last_peak_alert_time = 0.0     # timestamp of last new-peak notification
+        self.last_peak_alert_level = 0.0    # peak value at last new-peak notification
         self.profit_target_hit = False   # only fire profit target exit once
         self.loss_warning_1_hit = False  # -20k warning
         self.loss_warning_2_hit = False  # -30k cut size warning
@@ -492,6 +494,8 @@ def main():
             event = tracker.update_trailing_stop(total_pnl)
 
             if event == "armed":
+                tracker.last_peak_alert_level = tracker.trail_peak
+                tracker.last_peak_alert_time = now
                 drawdown = _trail_drawdown(tracker.trail_peak)
                 notify(
                     "🔒 Trailing lock armed",
@@ -499,11 +503,16 @@ def main():
                     priority="high",
                 )
             elif event == "new_peak":
-                drawdown = _trail_drawdown(tracker.trail_peak)
-                notify(
-                    f"📈 New peak: Rs {tracker.trail_peak:,.2f}",
-                    f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f} (Rs {drawdown:,.0f} drawdown)",
-                )
+                peak_move = tracker.trail_peak - tracker.last_peak_alert_level
+                time_since = now - tracker.last_peak_alert_time
+                if peak_move >= 2_000 and time_since >= 120:
+                    drawdown = _trail_drawdown(tracker.trail_peak)
+                    notify(
+                        f"📈 New peak: Rs {tracker.trail_peak:,.2f}",
+                        f"Exit floor raised to Rs {tracker.trail_exit_level:,.2f} (Rs {drawdown:,.0f} drawdown)",
+                    )
+                    tracker.last_peak_alert_level = tracker.trail_peak
+                    tracker.last_peak_alert_time = now
             elif event == "breach":
                 tracker.breach_since = now
                 tracker.auto_exited = False
