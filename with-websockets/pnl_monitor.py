@@ -41,6 +41,10 @@ NTFY_TOPIC          = os.getenv("NTFY_TOPIC", "")  # e.g. colin-pnl-xyz123
 
 MILESTONE_STEP              = float(os.getenv("MILESTONE_STEP", "5000"))
 
+# ---- Green day floor ----
+GREEN_DAY_ACTIVATION        = float(os.getenv("GREEN_DAY_ACTIVATION", "20000"))   # arm when P&L hits this
+GREEN_DAY_FLOOR             = float(os.getenv("GREEN_DAY_FLOOR", "5000"))          # exit if P&L drops to this
+
 # ---- Trailing profit-lock ----
 TRAIL_ACTIVATION_THRESHOLD  = float(os.getenv("TRAIL_ACTIVATION_THRESHOLD", "40000"))
 
@@ -282,6 +286,10 @@ class PositionTracker:
         self.auto_exited = False       # only fire auto-exit once per breach
         self.profit_target_hit = False  # only fire profit target exit once
         self.loss_limit_hit = False     # only fire loss limit exit once
+
+        # Green day floor state
+        self.green_day_armed = False    # True once P&L hits GREEN_DAY_ACTIVATION
+        self.green_day_exited = False   # only fire once
 
         self.refresh_positions()
 
@@ -542,6 +550,40 @@ def main():
                 except Exception as exc:
                     log.error("Auto-exit failed: %s", exc)
                     notify("🔴 Auto-exit ERROR", str(exc), priority="urgent")
+
+            # ---- Green day floor ----
+            if not tracker.trail_armed:
+                if not tracker.green_day_armed and total_pnl >= GREEN_DAY_ACTIVATION:
+                    tracker.green_day_armed = True
+                    log.info("Green day floor armed at Rs %.0f.", GREEN_DAY_FLOOR)
+                    notify(
+                        "🟢 Green day floor armed",
+                        f"P&L hit Rs {total_pnl:,.2f} — floor locked at Rs {GREEN_DAY_FLOOR:,.0f}",
+                        priority="high",
+                    )
+                if (AUTO_EXIT
+                        and tracker.green_day_armed
+                        and not tracker.green_day_exited
+                        and total_pnl <= GREEN_DAY_FLOOR):
+                    tracker.green_day_exited = True
+                    log.info("Green day floor Rs %.0f breached — auto-exiting.", GREEN_DAY_FLOOR)
+                    try:
+                        exited, skipped, failed = exit_non_hedge_positions(kite)
+                        lines = []
+                        if exited:
+                            lines.append(f"Exited: {', '.join(exited)}")
+                        if skipped:
+                            lines.append(f"Kept (hedge): {', '.join(skipped)}")
+                        if failed:
+                            lines.append(f"FAILED: {', '.join(failed)}")
+                        notify(
+                            f"🟢 Green day floor Rs {GREEN_DAY_FLOOR:,.0f} breached — exited",
+                            "\n".join(lines) if lines else "No positions to exit.",
+                            priority="urgent",
+                        )
+                    except Exception as exc:
+                        log.error("Green day exit failed: %s", exc)
+                        notify("🟢 Green day exit ERROR", str(exc), priority="urgent")
 
             # ---- Profit target exit ----
             if (not tracker.profit_target_hit
