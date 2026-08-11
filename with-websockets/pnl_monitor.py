@@ -71,7 +71,11 @@ EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait th
 
 # ---- Profit target exit ----
 PROFIT_TARGET           = float(os.getenv("PROFIT_TARGET", "80000"))   # exit all non-hedge positions when P&L hits this
-LOSS_LIMIT              = float(os.getenv("LOSS_LIMIT", "-40000"))     # exit all non-hedge positions when P&L hits this
+
+# ---- Loss warnings + hard limit ----
+LOSS_WARNING_1          = float(os.getenv("LOSS_WARNING_1", "-20000"))  # warning alert
+LOSS_WARNING_2          = float(os.getenv("LOSS_WARNING_2", "-30000"))  # cut position size alert
+LOSS_LIMIT              = float(os.getenv("LOSS_LIMIT", "-40000"))      # hard shutdown — exit all
 
 LOG_FILE = os.getenv("LOG_FILE", "pnl_monitor.log")
 
@@ -284,8 +288,10 @@ class PositionTracker:
         self.last_exit_alert = 0
         self.breach_since = None       # timestamp when breach started
         self.auto_exited = False       # only fire auto-exit once per breach
-        self.profit_target_hit = False  # only fire profit target exit once
-        self.loss_limit_hit = False     # only fire loss limit exit once
+        self.profit_target_hit = False   # only fire profit target exit once
+        self.loss_warning_1_hit = False  # -20k warning
+        self.loss_warning_2_hit = False  # -30k cut size warning
+        self.loss_limit_hit = False      # -40k hard shutdown
 
         # Green day floor state
         self.green_day_armed = False    # True once P&L hits GREEN_DAY_ACTIVATION
@@ -609,6 +615,27 @@ def main():
                     notify("🎯 Profit target exit ERROR", str(exc), priority="urgent")
 
             # ---- Loss limit exit ----
+            # ---- Loss warning 1: -20k ----
+            if not tracker.loss_warning_1_hit and total_pnl <= LOSS_WARNING_1:
+                tracker.loss_warning_1_hit = True
+                log.info("Loss warning 1 at Rs %.0f.", total_pnl)
+                notify(
+                    "⚠️ Loss warning — Rs 20k down",
+                    f"P&L is Rs {total_pnl:,.2f}. Stay cautious.",
+                    priority="high",
+                )
+
+            # ---- Loss warning 2: -30k ----
+            if not tracker.loss_warning_2_hit and total_pnl <= LOSS_WARNING_2:
+                tracker.loss_warning_2_hit = True
+                log.info("Loss warning 2 at Rs %.0f — cut position size.", total_pnl)
+                notify(
+                    "🔴 Loss at Rs 30k — cut position size by 50%",
+                    f"P&L is Rs {total_pnl:,.2f}. Hard shutdown at Rs {LOSS_LIMIT:,.0f}.",
+                    priority="urgent",
+                )
+
+            # ---- Loss limit: -40k hard shutdown ----
             if (not tracker.loss_limit_hit
                     and total_pnl <= LOSS_LIMIT):
                 tracker.loss_limit_hit = True
