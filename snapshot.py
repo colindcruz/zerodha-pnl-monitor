@@ -12,14 +12,22 @@ kite.set_access_token(token)
 
 positions = kite.positions()
 net = positions.get("net", [])
-total_pnl = sum(float(p.get("pnl", 0)) for p in net)
+
+open_pos = [p for p in net if p["quantity"] != 0]
+closed_pos = [p for p in net if p["quantity"] == 0]
+
+open_pnl = sum(float(p.get("pnl", 0)) for p in open_pos)
+realized_pnl = sum(float(p.get("pnl", 0)) for p in closed_pos)
+total_pnl = open_pnl + realized_pnl
 
 lines = ["📊 <b>Intraday P&L Snapshot</b>"]
-if net:
-    for p in net:
+if open_pos:
+    for p in sorted(open_pos, key=lambda x: -abs(float(x["pnl"]))):
         lines.append(f"{p['tradingsymbol']}: ₹{float(p['pnl']):,.2f}")
 else:
     lines.append("No open positions.")
+if realized_pnl != 0:
+    lines.append(f"Realized (closed): ₹{realized_pnl:,.2f}")
 lines.append(f"<b>Total: ₹{total_pnl:,.2f}</b>")
 
 msg = "\n".join(lines)
