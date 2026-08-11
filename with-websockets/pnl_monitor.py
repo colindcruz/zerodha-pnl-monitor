@@ -141,9 +141,31 @@ def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
         return {}
 
 
+def _cancel_open_orders(kite: KiteConnect, symbols: list[str]) -> int:
+    """Cancel any pending/open orders for the given symbols before placing exit orders."""
+    cancelled = 0
+    try:
+        orders = kite.orders()
+    except Exception as exc:
+        log.warning("Could not fetch open orders: %s — skipping cancel step", exc)
+        return 0
+
+    pending_statuses = {"OPEN", "TRIGGER PENDING"}
+    for order in orders:
+        if order.get("tradingsymbol") in symbols and order.get("status") in pending_statuses:
+            try:
+                kite.cancel_order(variety=order["variety"], order_id=order["order_id"])
+                log.info("Cancelled pending order %s for %s", order["order_id"], order["tradingsymbol"])
+                cancelled += 1
+            except Exception as exc:
+                log.warning("Could not cancel order %s: %s", order["order_id"], exc)
+    return cancelled
+
+
 def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list, list]:
     """
     Limit-exit all open positions with LTP >= HEDGE_PRICE_THRESHOLD.
+    Cancels any pending orders for those symbols first to avoid double-exits.
     Exits sold legs (short) first, then bought legs (long).
     Splits large orders into chunks to stay within exchange freeze limits.
     Returns (exited_symbols, skipped_symbols, failed_symbols).
@@ -170,6 +192,11 @@ def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list, list]:
     # Fetch lot sizes for splitting
     symbols = [p["tradingsymbol"] for p in to_exit]
     lot_sizes = _get_lot_sizes(kite, symbols)
+
+    # Cancel any pending orders for these symbols before placing exit orders
+    n_cancelled = _cancel_open_orders(kite, symbols)
+    if n_cancelled:
+        log.info("Cancelled %d pending order(s) before placing exit orders.", n_cancelled)
 
     exited, failed = [], []
 
