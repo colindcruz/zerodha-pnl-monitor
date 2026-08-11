@@ -505,7 +505,7 @@ def main():
             elif event == "new_peak":
                 peak_move = tracker.trail_peak - tracker.last_peak_alert_level
                 time_since = now - tracker.last_peak_alert_time
-                if peak_move >= 2_000 and time_since >= 120:
+                if peak_move >= 2_000 or time_since >= 120:
                     drawdown = _trail_drawdown(tracker.trail_peak)
                     notify(
                         f"📈 New peak: Rs {tracker.trail_peak:,.2f}",
