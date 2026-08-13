@@ -12,6 +12,7 @@ Secrets are loaded from a .env file (see .env.example).
 Run generate_token.py each morning to refresh the daily access token.
 """
 
+import json
 import math
 import os
 import time
@@ -102,6 +103,7 @@ INDEX_SPOT_SYMBOLS = {
 }
 
 LOG_FILE = os.getenv("LOG_FILE", "pnl_monitor.log")
+HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "pnl_history.json"))
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN  = (9, 15)
@@ -568,6 +570,10 @@ class PositionTracker:
         self.oversize_since = {}        # symbol -> timestamp when it first exceeded MAX_POSITION_QTY
         self.last_oversize_alert = 0.0  # timestamp of last oversize alert (60s cooldown)
 
+        # Session P&L range, for the EOD summary / history
+        self.session_peak_pnl = 0.0
+        self.session_trough_pnl = 0.0
+
         self.refresh_positions()
 
     def refresh_positions(self):
@@ -722,6 +728,76 @@ def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -
     return "\n".join(lines)
 
 
+# ---- Daily history / EOD summary ----
+
+def _load_history() -> list:
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        return json.loads(HISTORY_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        log.warning("History file unreadable — starting fresh.")
+        return []
+
+
+def append_history(tracker: "PositionTracker", total_pnl: float) -> dict:
+    """Appends (or replaces, if already recorded today) today's summary to HISTORY_FILE."""
+    today = date.today().isoformat()
+    record = {
+        "date": today,
+        "final_pnl": round(total_pnl, 2),
+        "peak_pnl": round(tracker.session_peak_pnl, 2),
+        "trough_pnl": round(tracker.session_trough_pnl, 2),
+        "trail_armed": tracker.trail_armed,
+        "trail_peak": round(tracker.trail_peak, 2) if tracker.trail_armed else None,
+        "green_day_armed": tracker.green_day_armed,
+        "loss_limit_hit": tracker.loss_limit_hit,
+        "profit_target_hit": tracker.profit_target_hit,
+        "auto_exit_fired": bool(
+            tracker.auto_exited or tracker.green_day_exited
+            or tracker.profit_target_hit or tracker.loss_limit_hit
+        ),
+    }
+
+    history = [h for h in _load_history() if h.get("date") != today]
+    history.append(record)
+    try:
+        HISTORY_FILE.write_text(json.dumps(history, indent=2))
+    except OSError as exc:
+        log.error("Could not write history file: %s", exc)
+
+    return record
+
+
+def format_eod_summary(record: dict) -> str:
+    lines = [f"📅 EOD SUMMARY — {record['date']}"]
+    lines.append(f"Final P&L: Rs {record['final_pnl']:,.2f}")
+    lines.append(f"Peak: Rs {record['peak_pnl']:,.2f}  |  Trough: Rs {record['trough_pnl']:,.2f}")
+
+    giveback = record["peak_pnl"] - record["final_pnl"]
+    if giveback > 0:
+        lines.append(f"Gave back Rs {giveback:,.2f} from the day's peak")
+
+    if record["trail_armed"]:
+        lines.append(f"Trailing lock was armed (peak Rs {record['trail_peak']:,.2f})")
+    if record["auto_exit_fired"]:
+        lines.append("⚠️ An auto-exit fired today")
+
+    return "\n".join(lines)
+
+
+def format_history(history: list, n: int = 7) -> str:
+    if not history:
+        return "No history yet."
+
+    lines = [f"📅 P&L HISTORY (last {min(n, len(history))} day(s))"]
+    for rec in history[-n:]:
+        flag = " ⚠️exit" if rec.get("auto_exit_fired") else ""
+        lines.append(f"{rec['date']}: Rs {rec['final_pnl']:,.2f} (peak Rs {rec['peak_pnl']:,.2f}){flag}")
+
+    return "\n".join(lines)
+
+
 # ---- Live-tunable thresholds via Telegram ----
 
 SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
@@ -834,6 +910,8 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                         reply(format_greeks(per_underlying, skipped))
                     else:
                         reply("Monitor not ready yet.")
+                elif text == "/history":
+                    reply(format_history(_load_history()))
                 elif text == "/stop":
                     MUTE_FILE.touch()
                     reply("🔕 Notifications muted. Monitor is still running. Send /start to resume.")
@@ -850,6 +928,7 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                         "/resume — enable auto-exit\n"
                         "/status — full status (P&L, floors, headroom, pause/mute state)\n"
                         "/greeks — portfolio delta/theta/vega by underlying\n"
+                        "/history — last 7 days' EOD P&L summary\n"
                         "/set — list tunable thresholds\n"
                         "/set <param> <value> — change a threshold live, e.g. /set loss_limit -50000"
                     )
@@ -934,6 +1013,7 @@ def main():
     last_position_refresh = time.time()
     last_trailing_heartbeat = 0
     last_heartbeat = time.time()
+    eod_summary_sent = False
 
     try:
         while True:
@@ -973,6 +1053,15 @@ def main():
                 last_position_refresh = now
 
             total_pnl, details = tracker.compute_pnl()
+            tracker.session_peak_pnl = max(tracker.session_peak_pnl, total_pnl)
+            tracker.session_trough_pnl = min(tracker.session_trough_pnl, total_pnl)
+
+            # ---- EOD summary: fires once, the first loop iteration after market close ----
+            if not eod_summary_sent and not is_market_open():
+                record = append_history(tracker, total_pnl)
+                notify("📅 EOD Summary", format_eod_summary(record))
+                log.info("EOD summary recorded: %s", record)
+                eod_summary_sent = True
 
             # ---- Position size limit check ----
             breaching = [
