@@ -253,6 +253,41 @@ def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, fl
     return trigger, limit_price, order_ids
 
 
+def _protect_new_position(kite: KiteConnect, tracker: "PositionTracker", token: int, pos: dict) -> None:
+    """
+    Computes ATR and places a protective SL for a freshly-opened non-hedge position, then notifies.
+    Shared by both the real-time (on_order_update) and periodic (REST refresh) detection paths;
+    tracker.sl_placed_symbols dedupes so only one of them actually places the order per opening.
+    Safe to call from any thread — does its own locking and makes blocking network calls, so
+    callers on the websocket thread should dispatch it via a background thread.
+    """
+    symbol = pos["tradingsymbol"]
+    price = pos.get("last_price") or pos.get("average_price", 0)
+    if price < HEDGE_PRICE_THRESHOLD:
+        return  # hedge leg — never auto-protected, same exclusion auto-exit uses
+
+    with tracker.lock:
+        if symbol in tracker.sl_placed_symbols:
+            return
+        tracker.sl_placed_symbols.add(symbol)
+
+    direction = "LONG" if pos["quantity"] > 0 else "SHORT"
+    atr = _fetch_atr(kite, token, symbol)
+    atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
+    sl_line = ""
+    if atr:
+        try:
+            trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr)
+            sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price}"
+        except Exception as exc:
+            log.error("SL order failed for %s: %s", symbol, exc)
+            sl_line = f"SL order FAILED: {exc}"
+    notify(
+        f"📐 New position: {symbol}",
+        f"{direction} {abs(pos['quantity'])} qty\n{atr_line}\n{sl_line}".strip(),
+    )
+
+
 def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
     """Fetch lot sizes for a list of NFO tradingsymbols."""
     try:
@@ -570,9 +605,18 @@ class PositionTracker:
         self.oversize_since = {}        # symbol -> timestamp when it first exceeded MAX_POSITION_QTY
         self.last_oversize_alert = 0.0  # timestamp of last oversize alert (60s cooldown)
 
+        # Symbols that already have a protective SL placed for their current open leg —
+        # dedupes between the real-time (on_order_update) and periodic (REST) detection paths.
+        self.sl_placed_symbols = set()
+
         # Session P&L range, for the EOD summary / history
         self.session_peak_pnl = 0.0
         self.session_trough_pnl = 0.0
+
+        # Running signed qty per symbol, fed by on_order_update fills — lets us detect
+        # a flat->nonzero transition (a fresh entry) in real time, without waiting for
+        # the next REST position refresh, so a protective SL can be placed immediately.
+        self.live_qty = {}
 
         self.refresh_positions()
 
@@ -1000,12 +1044,62 @@ def main():
         log.error("WebSocket gave up reconnecting.")
         notify("⚠️ Connection lost", "WebSocket could not reconnect. Please check the server.", priority="high")
 
+    def on_order_update(ws, data):
+        """
+        Fires within ~seconds of any of the account's orders completing — the fast path for
+        placing a protective SL on a fresh entry, instead of waiting up to 2 min for the next
+        REST position refresh. Only reacts to fills that take a symbol from flat to non-flat
+        (or flip its sign); adding to or reducing an existing position doesn't re-trigger.
+        """
+        try:
+            if data.get("status") != "COMPLETE":
+                return
+            exchange = data.get("exchange")
+            symbol = data.get("tradingsymbol")
+            qty = int(data.get("quantity") or 0)
+            txn = data.get("transaction_type")
+            avg_price = float(data.get("average_price") or 0)
+            product = data.get("product")
+            try:
+                token = int(data.get("instrument_token"))
+            except (TypeError, ValueError):
+                token = None
+            if exchange != "NFO" or not symbol or qty <= 0 or not token:
+                return
+
+            d = qty if txn == "BUY" else -qty
+            with tracker.lock:
+                prev_qty = tracker.live_qty.get(symbol, 0)
+                new_qty = prev_qty + d
+                tracker.live_qty[symbol] = new_qty
+                if new_qty == 0:
+                    tracker.sl_placed_symbols.discard(symbol)  # flat again — next entry gets freshly protected
+
+            opened_fresh = (prev_qty == 0 and new_qty != 0) or (
+                prev_qty != 0 and new_qty != 0 and (prev_qty > 0) != (new_qty > 0)
+            )
+            if not opened_fresh:
+                return
+
+            pos = {
+                "tradingsymbol": symbol,
+                "quantity": new_qty,
+                "average_price": avg_price,
+                "last_price": avg_price,
+                "exchange": exchange,
+                "product": product,
+            }
+            threading.Thread(target=_protect_new_position, args=(kite, tracker, token, pos), daemon=True).start()
+        except Exception as exc:
+            log.warning("on_order_update handling failed: %s", exc)
+
     kws.on_connect = on_connect
     kws.on_ticks = on_ticks
     kws.on_close = on_close
     kws.on_error = on_error
     kws.on_reconnect = on_reconnect
     kws.on_noreconnect = on_noreconnect
+    kws.on_order_update = on_order_update
 
     # Run the ticker in a background thread so we can run our own alert loop here
     kws.connect(threaded=True)
@@ -1028,28 +1122,15 @@ def main():
                     kws.subscribe(list(new_tokens))
                     kws.set_mode(kws.MODE_FULL, list(new_tokens))
                     log.info("Position set changed — re-subscribed.")
-                    # ATR notification for newly opened non-hedge positions
+                    # SL protection for newly opened non-hedge positions — this REST poll is a
+                    # 2-min-lagging safety net; on_order_update below is the fast path that
+                    # normally already handles it (sl_placed_symbols dedupes the two).
                     added_tokens = new_tokens - old_tokens
                     if added_tokens:
                         with tracker.lock:
                             new_pos = {t: tracker.positions[t] for t in added_tokens if t in tracker.positions}
                         for token, pos in new_pos.items():
-                            if pos["last_price"] >= HEDGE_PRICE_THRESHOLD:
-                                direction = "LONG" if pos["quantity"] > 0 else "SHORT"
-                                atr = _fetch_atr(kite, token, pos["tradingsymbol"])
-                                atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
-                                sl_line = ""
-                                if atr:
-                                    try:
-                                        trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr)
-                                        sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price}"
-                                    except Exception as exc:
-                                        log.error("SL order failed for %s: %s", pos["tradingsymbol"], exc)
-                                        sl_line = f"SL order FAILED: {exc}"
-                                notify(
-                                    f"📐 New position: {pos['tradingsymbol']}",
-                                    f"{direction} {abs(pos['quantity'])} qty\n{atr_line}\n{sl_line}".strip(),
-                                )
+                            _protect_new_position(kite, tracker, token, pos)
                 last_position_refresh = now
 
             total_pnl, details = tracker.compute_pnl()
