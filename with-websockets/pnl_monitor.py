@@ -14,6 +14,7 @@ Run generate_token.py each morning to refresh the daily access token.
 
 import math
 import os
+import signal
 import time
 import logging
 import threading
@@ -544,8 +545,13 @@ def _telegram_command_listener(tracker_ref: list):
                         reply(format_summary(total_pnl, details))
                     else:
                         reply("Monitor not ready yet.")
+                elif text == "/stop":
+                    reply("🛑 Monitor stopped. Restart tomorrow with 'systemctl start pnl-monitor' after generating your token.")
+                    log.info("Monitor stopped via Telegram /stop command.")
+                    time.sleep(1)  # ensure reply is sent before process exits
+                    os.kill(os.getpid(), signal.SIGTERM)
                 elif text == "/help":
-                    reply("/pause — disable auto-exit\n/resume — enable auto-exit\n/status — current P&L")
+                    reply("/pause — disable auto-exit\n/resume — enable auto-exit\n/status — current P&L\n/stop — stop the monitor")
         except Exception as exc:
             log.warning("Telegram command listener error: %s", exc)
             time.sleep(5)
