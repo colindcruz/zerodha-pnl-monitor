@@ -491,6 +491,66 @@ def format_summary(total_pnl, details):
     return "\n".join(lines)
 
 
+# ---- Telegram command listener ----
+
+def _telegram_command_listener(tracker_ref: list):
+    """
+    Background thread that polls Telegram for commands and acts on them.
+    tracker_ref is a one-element list so we can access the tracker after it's created.
+    Supported commands:
+      /pause   — disable auto-exit (creates pause file)
+      /resume  — enable auto-exit (removes pause file)
+      /status  — send current P&L snapshot
+    """
+    url_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    offset = 0
+
+    def reply(text: str):
+        try:
+            requests.post(f"{url_base}/sendMessage",
+                          data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+        except Exception:
+            pass
+
+    while True:
+        try:
+            resp = requests.get(
+                f"{url_base}/getUpdates",
+                params={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                timeout=35,
+            )
+            if not resp.ok:
+                time.sleep(5)
+                continue
+            for update in resp.json().get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip().lower()
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
+                if text == "/pause":
+                    PAUSE_FILE.touch()
+                    reply("⏸ Auto-exit PAUSED. Send /resume to re-enable.")
+                    log.info("Auto-exit paused via Telegram.")
+                elif text == "/resume":
+                    PAUSE_FILE.unlink(missing_ok=True)
+                    reply("▶️ Auto-exit RESUMED.")
+                    log.info("Auto-exit resumed via Telegram.")
+                elif text == "/status":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    if tracker:
+                        total_pnl, details = tracker.compute_pnl()
+                        reply(format_summary(total_pnl, details))
+                    else:
+                        reply("Monitor not ready yet.")
+                elif text == "/help":
+                    reply("/pause — disable auto-exit\n/resume — enable auto-exit\n/status — current P&L")
+        except Exception as exc:
+            log.warning("Telegram command listener error: %s", exc)
+            time.sleep(5)
+
+
 # ---- Main ----
 
 def main():
@@ -512,6 +572,12 @@ def main():
     kite.set_access_token(access_token)
 
     tracker = PositionTracker(kite)
+
+    # Start Telegram command listener in background
+    tracker_ref = [tracker]
+    cmd_thread = threading.Thread(target=_telegram_command_listener, args=(tracker_ref,), daemon=True)
+    cmd_thread.start()
+    log.info("Telegram command listener started.")
 
     if not tracker.instrument_tokens():
         log.warning("No open positions found. The script will keep watching and "
