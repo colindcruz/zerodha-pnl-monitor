@@ -63,6 +63,7 @@ def _trail_drawdown(peak: float) -> float:
     return 8_000  # fallback
 EXIT_ALERT_REPEAT_SECONDS   = int(os.getenv("EXIT_ALERT_REPEAT_SECONDS", "15"))
 TRAIL_CHECK_INTERVAL        = int(os.getenv("TRAIL_CHECK_INTERVAL", "1"))
+HEARTBEAT_INTERVAL_SECONDS  = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))
 
 # ---- Auto-exit on trailing breach ----
 AUTO_EXIT               = os.getenv("AUTO_EXIT", "true").lower() == "true"
@@ -494,6 +495,102 @@ def format_summary(total_pnl, details):
     return "\n".join(lines)
 
 
+def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -> str:
+    """Full status: P&L, active safety-net levels, headroom, and pause/mute state."""
+    now_ist = datetime.now(IST)
+    close_dt = now_ist.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0)
+    remaining = (close_dt - now_ist).total_seconds()
+    close_line = (
+        "Market closed"
+        if remaining <= 0
+        else f"Time to close: {int(remaining // 3600)}h {int(remaining % 3600 // 60)}m"
+    )
+
+    lines = [f"📊 STATUS — {now_ist.strftime('%H:%M:%S')}"]
+    lines.append(f"P&L: Rs {total_pnl:,.2f}  |  Open positions: {len(details)}")
+    lines.append(close_line)
+    lines.append("")
+
+    if tracker.trail_armed:
+        cushion = total_pnl - tracker.trail_exit_level
+        lines.append(
+            f"Trailing lock: ARMED | peak Rs {tracker.trail_peak:,.2f} | "
+            f"floor Rs {tracker.trail_exit_level:,.2f} | cushion Rs {cushion:,.2f}"
+        )
+    else:
+        lines.append(f"Trailing lock: not armed (arms at Rs {TRAIL_ACTIVATION_THRESHOLD:,.0f})")
+
+    if tracker.green_day_armed:
+        state = "exited" if tracker.green_day_exited else "armed"
+        lines.append(f"Green day floor: {state} at Rs {GREEN_DAY_FLOOR:,.0f}")
+
+    lines.append(f"Loss limit: Rs {LOSS_LIMIT:,.0f}  |  headroom Rs {total_pnl - LOSS_LIMIT:,.2f}")
+    if tracker.loss_warning_2_hit:
+        lines.append("  status: warning 2 (-30k) fired — size cut suggested")
+    elif tracker.loss_warning_1_hit:
+        lines.append("  status: warning 1 (-20k) fired")
+
+    lines.append(f"Profit target: Rs {PROFIT_TARGET:,.0f}" + (" — hit" if tracker.profit_target_hit else ""))
+
+    lines.append("")
+    lines.append(f"Auto-exit: {'PAUSED' if PAUSE_FILE.exists() else 'enabled'}")
+    lines.append(f"Notifications: {'MUTED' if MUTE_FILE.exists() else 'on'}")
+
+    if details:
+        lines.append("")
+        for d in sorted(details, key=lambda x: -abs(x["pnl"])):
+            lines.append(f"{d['symbol']}: {d['qty']} @ {d['avg_price']:.2f} -> LTP {d['ltp']:.2f} | Rs {d['pnl']:,.2f}")
+
+    return "\n".join(lines)
+
+
+# ---- Live-tunable thresholds via Telegram ----
+
+SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
+    "loss_warning_1": ("LOSS_WARNING_1", float),
+    "loss_warning_2": ("LOSS_WARNING_2", float),
+    "loss_limit": ("LOSS_LIMIT", float),
+    "profit_target": ("PROFIT_TARGET", float),
+    "trail_activation": ("TRAIL_ACTIVATION_THRESHOLD", float),
+    "green_day_activation": ("GREEN_DAY_ACTIVATION", float),
+    "green_day_floor": ("GREEN_DAY_FLOOR", float),
+    "milestone_step": ("MILESTONE_STEP", float),
+    "max_position_qty": ("MAX_POSITION_QTY", int),
+    "hedge_price_threshold": ("HEDGE_PRICE_THRESHOLD", float),
+    "exit_buffer_seconds": ("EXIT_BUFFER_SECONDS", int),
+}
+
+
+def _handle_set_command(text: str, reply) -> None:
+    """Handles '/set' (list current values) and '/set <param> <value>' (update one live)."""
+    parts = text.split()
+
+    if len(parts) == 1:
+        lines = [f"{key} = {globals()[var_name]}" for key, (var_name, _) in SETTABLE_PARAMS.items()]
+        reply("Current settings (/set <param> <value> to change):\n" + "\n".join(lines))
+        return
+
+    if len(parts) != 3:
+        reply("Usage: /set <param> <value>\nSend /set with no args to list params.")
+        return
+
+    _, key, raw_value = parts
+    if key not in SETTABLE_PARAMS:
+        reply(f"Unknown param '{key}'.\nAvailable: {', '.join(SETTABLE_PARAMS)}")
+        return
+
+    var_name, caster = SETTABLE_PARAMS[key]
+    try:
+        value = caster(raw_value)
+    except ValueError:
+        reply(f"Invalid value '{raw_value}' for {key} (expected {caster.__name__}).")
+        return
+
+    globals()[var_name] = value
+    reply(f"✅ {var_name} = {value}")
+    log.info("Updated %s to %s via Telegram /set.", var_name, value)
+
+
 # ---- Telegram command listener ----
 
 def _telegram_command_listener(tracker_ref: list):
@@ -544,9 +641,11 @@ def _telegram_command_listener(tracker_ref: list):
                     tracker = tracker_ref[0] if tracker_ref else None
                     if tracker:
                         total_pnl, details = tracker.compute_pnl()
-                        reply(format_summary(total_pnl, details))
+                        reply(format_status(tracker, total_pnl, details))
                     else:
                         reply("Monitor not ready yet.")
+                elif text == "/set" or text.startswith("/set "):
+                    _handle_set_command(text, reply)
                 elif text == "/stop":
                     MUTE_FILE.touch()
                     reply("🔕 Notifications muted. Monitor is still running. Send /start to resume.")
@@ -556,7 +655,15 @@ def _telegram_command_listener(tracker_ref: list):
                     reply("🔔 Notifications resumed.")
                     log.info("Notifications resumed via Telegram /start.")
                 elif text == "/help":
-                    reply("/stop — mute all notifications\n/start — resume notifications\n/pause — disable auto-exit\n/resume — enable auto-exit\n/status — current P&L")
+                    reply(
+                        "/stop — mute all notifications\n"
+                        "/start — resume notifications\n"
+                        "/pause — disable auto-exit\n"
+                        "/resume — enable auto-exit\n"
+                        "/status — full status (P&L, floors, headroom, pause/mute state)\n"
+                        "/set — list tunable thresholds\n"
+                        "/set <param> <value> — change a threshold live, e.g. /set loss_limit -50000"
+                    )
         except Exception as exc:
             log.warning("Telegram command listener error: %s", exc)
             time.sleep(5)
@@ -636,6 +743,7 @@ def main():
 
     last_position_refresh = time.time()
     last_trailing_heartbeat = 0
+    last_heartbeat = time.time()
 
     try:
         while True:
@@ -879,6 +987,14 @@ def main():
                 except Exception as exc:
                     log.error("Loss limit exit failed: %s", exc)
                     notify("🛑 Loss limit exit ERROR", str(exc), priority="urgent")
+
+            # ---- Liveness heartbeat: proves the monitor is still alive even when nothing crosses a threshold ----
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                notify(
+                    "💓 Heartbeat",
+                    f"Monitor alive. Positions: {len(details)} | P&L: Rs {total_pnl:,.2f}",
+                )
+                last_heartbeat = now
 
             # ---- Trailing heartbeat: every 60 s once armed ----
             if tracker.trail_armed and now - last_trailing_heartbeat >= 60:
