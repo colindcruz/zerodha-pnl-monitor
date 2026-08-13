@@ -74,12 +74,12 @@ def calc_sl(pos, atr):
     sl_dist = 2 * atr
     if qty > 0:
         trigger     = round(avg - sl_dist, 1)
-        buffer      = max(1.0, round(trigger * 0.01, 1))
+        buffer      = min(10.0, max(1.0, round(trigger * 0.01, 1)))
         limit_price = round(trigger - buffer, 1)
         tx          = "SELL"
     else:
         trigger     = round(avg + sl_dist, 1)
-        buffer      = max(1.0, round(trigger * 0.01, 1))
+        buffer      = min(10.0, max(1.0, round(trigger * 0.01, 1)))
         limit_price = round(trigger + buffer, 1)
         tx          = "BUY"
     return tx, trigger, limit_price
