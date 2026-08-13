@@ -154,6 +154,33 @@ def notify(title: str, body: str, priority: str = "default"):
 # ---- Auto-exit helper ----
 
 FREEZE_QTY_LIMIT = 1800  # NSE exchange freeze quantity per order for F&O
+ATR_PERIOD = 14
+ATR_INTERVAL = "5minute"
+
+
+def _fetch_atr(kite: KiteConnect, instrument_token: int, symbol: str) -> float | None:
+    """Fetch 5-min historical data and compute 14-period ATR for a symbol."""
+    from datetime import timedelta
+    try:
+        now_ist = datetime.now(IST)
+        from_dt = now_ist - timedelta(hours=3)  # 3 hrs covers 14+ 5-min bars
+        records = kite.historical_data(
+            instrument_token,
+            from_date=from_dt.replace(tzinfo=None),
+            to_date=now_ist.replace(tzinfo=None),
+            interval=ATR_INTERVAL,
+        )
+        if len(records) < ATR_PERIOD + 1:
+            log.warning("Not enough bars for ATR on %s (%d bars)", symbol, len(records))
+            return None
+        trs = []
+        for i in range(1, len(records)):
+            h, l, pc = records[i]["high"], records[i]["low"], records[i - 1]["close"]
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return round(sum(trs[-ATR_PERIOD:]) / ATR_PERIOD, 2)
+    except Exception as exc:
+        log.warning("ATR fetch failed for %s: %s", symbol, exc)
+        return None
 
 def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
     """Fetch lot sizes for a list of NFO tradingsymbols."""
@@ -493,6 +520,20 @@ def main():
                     kws.subscribe(list(new_tokens))
                     kws.set_mode(kws.MODE_FULL, list(new_tokens))
                     log.info("Position set changed — re-subscribed.")
+                    # ATR notification for newly opened non-hedge positions
+                    added_tokens = new_tokens - old_tokens
+                    if added_tokens:
+                        with tracker.lock:
+                            new_pos = {t: tracker.positions[t] for t in added_tokens if t in tracker.positions}
+                        for token, pos in new_pos.items():
+                            if pos["last_price"] >= HEDGE_PRICE_THRESHOLD:
+                                direction = "LONG" if pos["quantity"] > 0 else "SHORT"
+                                atr = _fetch_atr(kite, token, pos["tradingsymbol"])
+                                atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
+                                notify(
+                                    f"📐 New position: {pos['tradingsymbol']}",
+                                    f"{direction} {abs(pos['quantity'])} qty\n{atr_line}",
+                                )
                 last_position_refresh = now
 
             total_pnl, details = tracker.compute_pnl()
