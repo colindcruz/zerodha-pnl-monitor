@@ -209,20 +209,26 @@ def _fetch_atr(kite: KiteConnect, instrument_token: int, symbol: str) -> float |
         return None
 
 def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, float, list]:
-    """Place SL-Limit order at 2x ATR from average entry price."""
+    """
+    Place SL-Limit order at 2x ATR from the stop anchor (Turtle-style: the most recent
+    entry price when pyramiding into a winner, not the blended average cost — so the stop
+    ratchets toward each new add instead of loosening back to the average). Falls back to
+    average_price if the caller doesn't supply a stop_anchor (e.g. the REST-poll fallback
+    path, where anchor == average cost anyway since it only ever fires on a single fill).
+    """
     symbol  = pos["tradingsymbol"]
     qty     = pos["quantity"]
-    avg     = pos["average_price"]
+    anchor  = pos.get("stop_anchor", pos["average_price"])
     sl_dist = 2 * atr
 
-    if qty > 0:  # LONG — sell SL below entry
+    if qty > 0:  # LONG — sell SL below the anchor
         tx            = kite.TRANSACTION_TYPE_SELL
-        trigger       = round(avg - sl_dist, 1)
+        trigger       = round(anchor - sl_dist, 1)
         buffer        = min(10.0, max(1.0, round(trigger * 0.01, 1)))
         limit_price   = round(trigger - buffer, 1)
-    else:        # SHORT — buy SL above entry
+    else:        # SHORT — buy SL above the anchor
         tx            = kite.TRANSACTION_TYPE_BUY
-        trigger       = round(avg + sl_dist, 1)
+        trigger       = round(anchor + sl_dist, 1)
         buffer        = min(10.0, max(1.0, round(trigger * 0.01, 1)))
         limit_price   = round(trigger + buffer, 1)
 
@@ -256,8 +262,10 @@ def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, fl
 def _ensure_sl_order(kite: KiteConnect, tracker: "PositionTracker", token: int, pos: dict) -> None:
     """
     Resizes protection to match a position's current state: cancels any resting SL for
-    this symbol, then places a fresh one sized to the current quantity at the current
-    (blended) average cost. Called on every fill that leaves a nonzero position — a fresh
+    this symbol, then places a fresh one sized to the current quantity, anchored at
+    pos["stop_anchor"] (Turtle-style — the latest add's price when pyramiding, not the
+    blended average cost, so the stop ratchets toward each new entry rather than loosening
+    back to the average). Called on every fill that leaves a nonzero position — a fresh
     open, adding to an existing position, or partially reducing one — so the SL never sits
     stale at the wrong size (which for a reduction could otherwise oversell/overbuy past
     the actual holding once triggered).
@@ -291,9 +299,11 @@ def _ensure_sl_order(kite: KiteConnect, tracker: "PositionTracker", token: int, 
                 log.error("SL order failed for %s: %s", symbol, exc)
                 sl_line = f"SL order FAILED: {exc}"
 
+    anchor = pos.get("stop_anchor", pos["average_price"])
     notify(
         f"📐 Position update: {symbol}",
-        f"{direction} {abs(pos['quantity'])} qty @ avg Rs {pos['average_price']:.2f}\n{atr_line}\n{sl_line}".strip(),
+        f"{direction} {abs(pos['quantity'])} qty @ avg Rs {pos['average_price']:.2f} "
+        f"(SL anchor Rs {anchor:.2f})\n{atr_line}\n{sl_line}".strip(),
     )
 
 
@@ -1079,19 +1089,30 @@ def main():
 
             d = qty if txn == "BUY" else -qty
             with tracker.lock:
-                prev = tracker.live_position.get(symbol, {"qty": 0, "avg_cost": 0.0})
+                prev = tracker.live_position.get(symbol, {"qty": 0, "avg_cost": 0.0, "stop_anchor": 0.0})
                 prev_qty, prev_avg = prev["qty"], prev["avg_cost"]
 
                 if prev_qty == 0:
-                    new_qty, new_avg = d, avg_price
-                elif (prev_qty > 0) == (d > 0):  # adding to the same side
+                    # fresh open — anchor is this fill's own price
+                    new_qty, new_avg, new_anchor = d, avg_price, avg_price
+                elif (prev_qty > 0) == (d > 0):
+                    # adding to the same side (pyramiding) — anchor ratchets to the latest add,
+                    # Turtle-style, instead of loosening back to the blended average
                     new_qty = prev_qty + d
                     new_avg = (prev_qty * prev_avg + d * avg_price) / new_qty
-                else:  # reducing, closing, or reversing
+                    new_anchor = avg_price
+                elif abs(d) <= abs(prev_qty):
+                    # partial (or exact full) reduction — cost basis and anchor are unchanged
                     new_qty = prev_qty + d
-                    new_avg = prev_avg if abs(d) <= abs(prev_qty) else avg_price
+                    new_avg = prev_avg
+                    new_anchor = prev["stop_anchor"]
+                else:
+                    # reversed past flat — a fresh position in the new direction
+                    new_qty = prev_qty + d
+                    new_avg = avg_price
+                    new_anchor = avg_price
 
-                tracker.live_position[symbol] = {"qty": new_qty, "avg_cost": new_avg}
+                tracker.live_position[symbol] = {"qty": new_qty, "avg_cost": new_avg, "stop_anchor": new_anchor}
 
             if new_qty == 0:
                 # fully flat — clear any leftover SL so it can't later misfire into a fresh position
@@ -1102,6 +1123,7 @@ def main():
                 "tradingsymbol": symbol,
                 "quantity": new_qty,
                 "average_price": new_avg,
+                "stop_anchor": new_anchor,
                 "last_price": avg_price,
                 "exchange": exchange,
                 "product": product,
