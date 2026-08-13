@@ -164,7 +164,7 @@ def _fetch_atr(kite: KiteConnect, instrument_token: int, symbol: str) -> float |
     from datetime import timedelta
     try:
         now_ist = datetime.now(IST)
-        from_dt = now_ist - timedelta(hours=3)  # 3 hrs covers 14+ 5-min bars
+        from_dt = now_ist - timedelta(days=2)  # 2 days ensures enough bars even at market open
         records = kite.historical_data(
             instrument_token,
             from_date=from_dt.replace(tzinfo=None),
