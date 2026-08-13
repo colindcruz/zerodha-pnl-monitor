@@ -17,7 +17,7 @@ import os
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -88,6 +88,18 @@ LOSS_LIMIT              = float(os.getenv("LOSS_LIMIT", "-40000"))      # hard s
 
 # ---- Position size limit ----
 MAX_POSITION_QTY        = int(os.getenv("MAX_POSITION_QTY", "1950"))    # max qty per individual non-hedge position
+
+# ---- Greeks (for /greeks) ----
+RISK_FREE_RATE           = float(os.getenv("RISK_FREE_RATE", "0.065"))  # used for Black-Scholes IV/Greeks
+
+INDEX_SPOT_SYMBOLS = {
+    "NIFTY": "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+    "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NSE:NIFTY MIDCAP SELECT",
+    "SENSEX": "BSE:SENSEX",
+    "BANKEX": "BSE:BANKEX",
+}
 
 LOG_FILE = os.getenv("LOG_FILE", "pnl_monitor.log")
 
@@ -353,6 +365,172 @@ def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list, list]:
     return exited, skipped, failed
 
 
+# ---- Greeks ----
+
+def _get_option_meta(kite: KiteConnect, symbols: list[str]) -> dict[str, dict]:
+    """Fetch strike/expiry/instrument_type/underlying/lot_size for NFO symbols."""
+    try:
+        instruments = kite.instruments("NFO")
+        return {
+            i["tradingsymbol"]: {
+                "strike": float(i["strike"]),
+                "expiry": i["expiry"],
+                "instrument_type": i["instrument_type"],
+                "name": i["name"],
+                "lot_size": int(i["lot_size"]),
+            }
+            for i in instruments if i["tradingsymbol"] in symbols
+        }
+    except Exception as exc:
+        log.warning("Could not fetch option metadata: %s — Greeks unavailable", exc)
+        return {}
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-x * x / 2) / math.sqrt(2 * math.pi)
+
+
+def _bs_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def _implied_vol(price: float, S: float, K: float, T: float, r: float, is_call: bool) -> float | None:
+    """Bisection solve for IV from the option's own LTP — BS price is monotonic in sigma, so this always converges."""
+    if T <= 0 or price <= 0:
+        return None
+    lo, hi = 0.001, 5.0
+    if _bs_price(S, K, T, r, hi, is_call) < price:
+        return None  # quote implies vol beyond a sane range — skip rather than report garbage
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if _bs_price(S, K, T, r, mid, is_call) > price:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def _bs_greeks(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> dict:
+    if T <= 0 or sigma <= 0:
+        itm = (S > K) if is_call else (S < K)
+        return {"delta": (1.0 if is_call else -1.0) if itm else 0.0, "theta": 0.0, "vega": 0.0}
+    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    pdf_d1 = _norm_pdf(d1)
+    vega = S * pdf_d1 * math.sqrt(T) / 100  # rupees per share, per 1 point of IV
+    if is_call:
+        delta = _norm_cdf(d1)
+        theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * _norm_cdf(d2)) / 365
+    else:
+        delta = _norm_cdf(d1) - 1
+        theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * _norm_cdf(-d2)) / 365
+    return {"delta": delta, "theta": theta, "vega": vega}
+
+
+def compute_portfolio_greeks(kite: KiteConnect, details: list) -> tuple[dict, list]:
+    """
+    Net delta/theta/vega per underlying for all option/future legs in `details`
+    (from PositionTracker.compute_pnl). IV is backed out from each leg's own LTP,
+    so results track the market's current pricing rather than an assumed volatility.
+    Returns (per_underlying, skipped) — skipped lists symbols we couldn't model
+    (missing instrument metadata or no spot quote for the underlying).
+    """
+    symbols = [d["symbol"] for d in details]
+    if not symbols:
+        return {}, []
+
+    meta = _get_option_meta(kite, symbols)
+
+    underlyings = {m["name"] for m in meta.values()}
+    spot_symbols = {name: INDEX_SPOT_SYMBOLS.get(name, f"NSE:{name}") for name in underlyings}
+    try:
+        spot_data = kite.ltp(list(spot_symbols.values())) if spot_symbols else {}
+    except Exception as exc:
+        log.warning("Could not fetch spot LTPs for Greeks: %s", exc)
+        spot_data = {}
+    spots = {name: spot_data.get(sym, {}).get("last_price") for name, sym in spot_symbols.items()}
+
+    result: dict[str, dict] = {}
+    skipped = []
+
+    for d in details:
+        info = meta.get(d["symbol"])
+        if not info:
+            skipped.append(d["symbol"])
+            continue
+
+        bucket = result.setdefault(
+            info["name"], {"delta": 0.0, "theta": 0.0, "vega": 0.0, "lot_size": info["lot_size"]}
+        )
+
+        if info["instrument_type"] == "FUT":
+            bucket["delta"] += d["qty"]
+            continue
+
+        if info["instrument_type"] not in ("CE", "PE"):
+            skipped.append(d["symbol"])
+            continue
+
+        spot = spots.get(info["name"])
+        if not spot:
+            skipped.append(d["symbol"])
+            continue
+
+        expiry = info["expiry"].date() if isinstance(info["expiry"], datetime) else info["expiry"]
+        T = max((expiry - date.today()).days, 0) / 365
+        is_call = info["instrument_type"] == "CE"
+
+        iv = _implied_vol(d["ltp"], spot, info["strike"], T, RISK_FREE_RATE, is_call)
+        if iv is None:
+            skipped.append(d["symbol"])
+            continue
+
+        greeks = _bs_greeks(spot, info["strike"], T, RISK_FREE_RATE, iv, is_call)
+        bucket["delta"] += greeks["delta"] * d["qty"]
+        bucket["theta"] += greeks["theta"] * d["qty"]
+        bucket["vega"] += greeks["vega"] * d["qty"]
+
+    return result, skipped
+
+
+def format_greeks(per_underlying: dict, skipped: list) -> str:
+    if not per_underlying and not skipped:
+        return "No open positions."
+
+    lines = ["📐 PORTFOLIO GREEKS"]
+    total_delta = total_theta = total_vega = 0.0
+    for name, g in per_underlying.items():
+        lots = g["delta"] / g["lot_size"] if g["lot_size"] else 0.0
+        lines.append(
+            f"{name}: delta {g['delta']:,.0f} ({lots:+.1f} lots) | "
+            f"theta Rs {g['theta']:,.0f}/day | vega Rs {g['vega']:,.0f} per 1% IV"
+        )
+        total_delta += g["delta"]
+        total_theta += g["theta"]
+        total_vega += g["vega"]
+
+    if len(per_underlying) > 1:
+        lines.append(
+            f"Total: delta {total_delta:,.0f} | theta Rs {total_theta:,.0f}/day | vega Rs {total_vega:,.0f} per 1% IV"
+        )
+
+    if skipped:
+        lines.append("")
+        lines.append(f"Unmodeled (missing data): {', '.join(skipped)}")
+
+    return "\n".join(lines)
+
+
 # ---- Position tracking ----
 
 class PositionTracker:
@@ -593,14 +771,15 @@ def _handle_set_command(text: str, reply) -> None:
 
 # ---- Telegram command listener ----
 
-def _telegram_command_listener(tracker_ref: list):
+def _telegram_command_listener(tracker_ref: list, kite_ref: list):
     """
     Background thread that polls Telegram for commands and acts on them.
-    tracker_ref is a one-element list so we can access the tracker after it's created.
+    tracker_ref/kite_ref are one-element lists so we can access objects created after this thread starts.
     Supported commands:
       /pause   — disable auto-exit (creates pause file)
       /resume  — enable auto-exit (removes pause file)
       /status  — send current P&L snapshot
+      /greeks  — send portfolio delta/theta/vega
     """
     url_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     offset = 0
@@ -646,6 +825,15 @@ def _telegram_command_listener(tracker_ref: list):
                         reply("Monitor not ready yet.")
                 elif text == "/set" or text.startswith("/set "):
                     _handle_set_command(text, reply)
+                elif text == "/greeks":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    kite = kite_ref[0] if kite_ref else None
+                    if tracker and kite:
+                        _, details = tracker.compute_pnl()
+                        per_underlying, skipped = compute_portfolio_greeks(kite, details)
+                        reply(format_greeks(per_underlying, skipped))
+                    else:
+                        reply("Monitor not ready yet.")
                 elif text == "/stop":
                     MUTE_FILE.touch()
                     reply("🔕 Notifications muted. Monitor is still running. Send /start to resume.")
@@ -661,6 +849,7 @@ def _telegram_command_listener(tracker_ref: list):
                         "/pause — disable auto-exit\n"
                         "/resume — enable auto-exit\n"
                         "/status — full status (P&L, floors, headroom, pause/mute state)\n"
+                        "/greeks — portfolio delta/theta/vega by underlying\n"
                         "/set — list tunable thresholds\n"
                         "/set <param> <value> — change a threshold live, e.g. /set loss_limit -50000"
                     )
@@ -693,7 +882,8 @@ def main():
 
     # Start Telegram command listener in background
     tracker_ref = [tracker]
-    cmd_thread = threading.Thread(target=_telegram_command_listener, args=(tracker_ref,), daemon=True)
+    kite_ref = [kite]
+    cmd_thread = threading.Thread(target=_telegram_command_listener, args=(tracker_ref, kite_ref), daemon=True)
     cmd_thread.start()
     log.info("Telegram command listener started.")
 
