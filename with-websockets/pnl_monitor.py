@@ -193,12 +193,12 @@ def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, fl
     if qty > 0:  # LONG — sell SL below entry
         tx            = kite.TRANSACTION_TYPE_SELL
         trigger       = round(avg - sl_dist, 1)
-        buffer        = max(1.0, round(trigger * 0.01, 1))
+        buffer        = min(10.0, max(1.0, round(trigger * 0.01, 1)))
         limit_price   = round(trigger - buffer, 1)
     else:        # SHORT — buy SL above entry
         tx            = kite.TRANSACTION_TYPE_BUY
         trigger       = round(avg + sl_dist, 1)
-        buffer        = max(1.0, round(trigger * 0.01, 1))
+        buffer        = min(10.0, max(1.0, round(trigger * 0.01, 1)))
         limit_price   = round(trigger + buffer, 1)
 
     lot_sizes = _get_lot_sizes(kite, [symbol])
