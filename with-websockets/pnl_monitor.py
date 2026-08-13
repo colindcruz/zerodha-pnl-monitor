@@ -253,38 +253,47 @@ def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, fl
     return trigger, limit_price, order_ids
 
 
-def _protect_new_position(kite: KiteConnect, tracker: "PositionTracker", token: int, pos: dict) -> None:
+def _ensure_sl_order(kite: KiteConnect, tracker: "PositionTracker", token: int, pos: dict) -> None:
     """
-    Computes ATR and places a protective SL for a freshly-opened non-hedge position, then notifies.
-    Shared by both the real-time (on_order_update) and periodic (REST refresh) detection paths;
-    tracker.sl_placed_symbols dedupes so only one of them actually places the order per opening.
-    Safe to call from any thread — does its own locking and makes blocking network calls, so
-    callers on the websocket thread should dispatch it via a background thread.
+    Resizes protection to match a position's current state: cancels any resting SL for
+    this symbol, then places a fresh one sized to the current quantity at the current
+    (blended) average cost. Called on every fill that leaves a nonzero position — a fresh
+    open, adding to an existing position, or partially reducing one — so the SL never sits
+    stale at the wrong size (which for a reduction could otherwise oversell/overbuy past
+    the actual holding once triggered).
+
+    Shared by both the real-time (on_order_update) and periodic (REST refresh) detection
+    paths. Safe to call from any thread — does its own locking and makes blocking network
+    calls, so callers on the websocket thread should dispatch it via a background thread.
     """
     symbol = pos["tradingsymbol"]
     price = pos.get("last_price") or pos.get("average_price", 0)
     if price < HEDGE_PRICE_THRESHOLD:
         return  # hedge leg — never auto-protected, same exclusion auto-exit uses
 
-    with tracker.lock:
-        if symbol in tracker.sl_placed_symbols:
-            return
-        tracker.sl_placed_symbols.add(symbol)
-
-    direction = "LONG" if pos["quantity"] > 0 else "SHORT"
-    atr = _fetch_atr(kite, token, symbol)
-    atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
-    sl_line = ""
-    if atr:
+    with tracker.sl_order_lock:
         try:
-            trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr)
-            sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price}"
+            n_cancelled = _cancel_open_orders(kite, [symbol])
+            if n_cancelled:
+                log.info("Cancelled %d prior order(s) for %s before resizing SL.", n_cancelled, symbol)
         except Exception as exc:
-            log.error("SL order failed for %s: %s", symbol, exc)
-            sl_line = f"SL order FAILED: {exc}"
+            log.warning("Could not cancel prior orders for %s: %s", symbol, exc)
+
+        direction = "LONG" if pos["quantity"] > 0 else "SHORT"
+        atr = _fetch_atr(kite, token, symbol)
+        atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
+        sl_line = ""
+        if atr:
+            try:
+                trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr)
+                sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price}"
+            except Exception as exc:
+                log.error("SL order failed for %s: %s", symbol, exc)
+                sl_line = f"SL order FAILED: {exc}"
+
     notify(
-        f"📐 New position: {symbol}",
-        f"{direction} {abs(pos['quantity'])} qty\n{atr_line}\n{sl_line}".strip(),
+        f"📐 Position update: {symbol}",
+        f"{direction} {abs(pos['quantity'])} qty @ avg Rs {pos['average_price']:.2f}\n{atr_line}\n{sl_line}".strip(),
     )
 
 
@@ -605,18 +614,17 @@ class PositionTracker:
         self.oversize_since = {}        # symbol -> timestamp when it first exceeded MAX_POSITION_QTY
         self.last_oversize_alert = 0.0  # timestamp of last oversize alert (60s cooldown)
 
-        # Symbols that already have a protective SL placed for their current open leg —
-        # dedupes between the real-time (on_order_update) and periodic (REST) detection paths.
-        self.sl_placed_symbols = set()
-
         # Session P&L range, for the EOD summary / history
         self.session_peak_pnl = 0.0
         self.session_trough_pnl = 0.0
 
-        # Running signed qty per symbol, fed by on_order_update fills — lets us detect
-        # a flat->nonzero transition (a fresh entry) in real time, without waiting for
-        # the next REST position refresh, so a protective SL can be placed immediately.
-        self.live_qty = {}
+        # Running {symbol: {"qty": signed int, "avg_cost": float}}, fed by on_order_update
+        # fills — real-time position state (qty + blended cost) so the protective SL can be
+        # resized to match on every fill, without waiting for the next REST position refresh.
+        self.live_position = {}
+        # Serializes SL cancel-then-replace so near-simultaneous fills on the same symbol
+        # (e.g. one order split into several by the exchange) don't race each other.
+        self.sl_order_lock = threading.Lock()
 
         self.refresh_positions()
 
@@ -1047,9 +1055,11 @@ def main():
     def on_order_update(ws, data):
         """
         Fires within ~seconds of any of the account's orders completing — the fast path for
-        placing a protective SL on a fresh entry, instead of waiting up to 2 min for the next
-        REST position refresh. Only reacts to fills that take a symbol from flat to non-flat
-        (or flip its sign); adding to or reducing an existing position doesn't re-trigger.
+        keeping the protective SL in sync with the position, instead of waiting up to 2 min
+        for the next REST position refresh. Every fill that leaves a nonzero position (a
+        fresh open, adding more, or a partial reduction) gets the SL resized to match the
+        new quantity and blended average cost. A fill that flattens the position cancels any
+        leftover SL instead, so a stale order can't misfire into an unintended new position.
         """
         try:
             if data.get("status") != "COMPLETE":
@@ -1069,27 +1079,34 @@ def main():
 
             d = qty if txn == "BUY" else -qty
             with tracker.lock:
-                prev_qty = tracker.live_qty.get(symbol, 0)
-                new_qty = prev_qty + d
-                tracker.live_qty[symbol] = new_qty
-                if new_qty == 0:
-                    tracker.sl_placed_symbols.discard(symbol)  # flat again — next entry gets freshly protected
+                prev = tracker.live_position.get(symbol, {"qty": 0, "avg_cost": 0.0})
+                prev_qty, prev_avg = prev["qty"], prev["avg_cost"]
 
-            opened_fresh = (prev_qty == 0 and new_qty != 0) or (
-                prev_qty != 0 and new_qty != 0 and (prev_qty > 0) != (new_qty > 0)
-            )
-            if not opened_fresh:
+                if prev_qty == 0:
+                    new_qty, new_avg = d, avg_price
+                elif (prev_qty > 0) == (d > 0):  # adding to the same side
+                    new_qty = prev_qty + d
+                    new_avg = (prev_qty * prev_avg + d * avg_price) / new_qty
+                else:  # reducing, closing, or reversing
+                    new_qty = prev_qty + d
+                    new_avg = prev_avg if abs(d) <= abs(prev_qty) else avg_price
+
+                tracker.live_position[symbol] = {"qty": new_qty, "avg_cost": new_avg}
+
+            if new_qty == 0:
+                # fully flat — clear any leftover SL so it can't later misfire into a fresh position
+                threading.Thread(target=_cancel_open_orders, args=(kite, [symbol]), daemon=True).start()
                 return
 
             pos = {
                 "tradingsymbol": symbol,
                 "quantity": new_qty,
-                "average_price": avg_price,
+                "average_price": new_avg,
                 "last_price": avg_price,
                 "exchange": exchange,
                 "product": product,
             }
-            threading.Thread(target=_protect_new_position, args=(kite, tracker, token, pos), daemon=True).start()
+            threading.Thread(target=_ensure_sl_order, args=(kite, tracker, token, pos), daemon=True).start()
         except Exception as exc:
             log.warning("on_order_update handling failed: %s", exc)
 
@@ -1130,7 +1147,7 @@ def main():
                         with tracker.lock:
                             new_pos = {t: tracker.positions[t] for t in added_tokens if t in tracker.positions}
                         for token, pos in new_pos.items():
-                            _protect_new_position(kite, tracker, token, pos)
+                            _ensure_sl_order(kite, tracker, token, pos)
                 last_position_refresh = now
 
             total_pnl, details = tracker.compute_pnl()
