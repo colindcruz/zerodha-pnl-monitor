@@ -66,6 +66,13 @@ TRAIL_CHECK_INTERVAL        = int(os.getenv("TRAIL_CHECK_INTERVAL", "1"))
 
 # ---- Auto-exit on trailing breach ----
 AUTO_EXIT               = os.getenv("AUTO_EXIT", "true").lower() == "true"
+PAUSE_FILE              = Path("pause_auto_exit")  # touch this file to temporarily disable auto-exit
+
+def auto_exit_enabled() -> bool:
+    """Returns False if the pause file exists — allows disabling auto-exit without restart."""
+    if PAUSE_FILE.exists():
+        return False
+    return AUTO_EXIT
 HEDGE_PRICE_THRESHOLD   = float(os.getenv("HEDGE_PRICE_THRESHOLD", "5.0"))  # positions with LTP below this are kept
 EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait this long below floor before exiting
 
@@ -645,7 +652,7 @@ def main():
             elif event == "breach":
                 tracker.breach_since = now
                 tracker.auto_exited = False
-                buffer_msg = f"Exiting in {EXIT_BUFFER_SECONDS}s if not recovered." if AUTO_EXIT else ""
+                buffer_msg = f"Exiting in {EXIT_BUFFER_SECONDS}s if not recovered." if auto_exit_enabled() else "Auto-exit PAUSED."
                 notify(
                     "🚨 Trailing floor breached",
                     f"P&L Rs {total_pnl:,.2f} hit floor Rs {tracker.trail_exit_level:,.2f}\n{buffer_msg}",
@@ -674,7 +681,7 @@ def main():
                 tracker.last_exit_alert = now
 
             # ---- Auto-exit after buffer period ----
-            if (AUTO_EXIT
+            if (auto_exit_enabled()
                     and tracker.trail_breached
                     and not tracker.auto_exited
                     and tracker.breach_since is not None
@@ -705,7 +712,7 @@ def main():
                         f"P&L hit Rs {total_pnl:,.2f} — floor locked at Rs {GREEN_DAY_FLOOR:,.0f}",
                         priority="high",
                     )
-                if (AUTO_EXIT
+                if (auto_exit_enabled()
                         and tracker.green_day_armed
                         and not tracker.green_day_exited
                         and total_pnl <= GREEN_DAY_FLOOR):
