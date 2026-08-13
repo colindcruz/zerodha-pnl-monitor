@@ -14,7 +14,6 @@ Run generate_token.py each morning to refresh the daily access token.
 
 import math
 import os
-import signal
 import time
 import logging
 import threading
@@ -68,6 +67,7 @@ TRAIL_CHECK_INTERVAL        = int(os.getenv("TRAIL_CHECK_INTERVAL", "1"))
 # ---- Auto-exit on trailing breach ----
 AUTO_EXIT               = os.getenv("AUTO_EXIT", "true").lower() == "true"
 PAUSE_FILE              = Path("pause_auto_exit")  # touch this file to temporarily disable auto-exit
+MUTE_FILE               = Path("mute_notifications")  # touch this file to silence all notifications
 
 def auto_exit_enabled() -> bool:
     """Returns False if the pause file exists — allows disabling auto-exit without restart."""
@@ -155,7 +155,9 @@ def send_ntfy(title: str, body: str, priority: str = "default"):
 
 
 def notify(title: str, body: str, priority: str = "default"):
-    """Send to both Telegram and ntfy."""
+    """Send to both Telegram and ntfy. Silenced if mute file exists."""
+    if MUTE_FILE.exists():
+        return
     send_telegram(f"{title}\n{body}" if title else body)
     send_ntfy(title, body, priority)
 
@@ -546,12 +548,15 @@ def _telegram_command_listener(tracker_ref: list):
                     else:
                         reply("Monitor not ready yet.")
                 elif text == "/stop":
-                    reply("🛑 Monitor stopped. Restart tomorrow with 'systemctl start pnl-monitor' after generating your token.")
-                    log.info("Monitor stopped via Telegram /stop command.")
-                    time.sleep(1)  # ensure reply is sent before process exits
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    MUTE_FILE.touch()
+                    reply("🔕 Notifications muted. Monitor is still running. Send /start to resume.")
+                    log.info("Notifications muted via Telegram /stop.")
+                elif text == "/start":
+                    MUTE_FILE.unlink(missing_ok=True)
+                    reply("🔔 Notifications resumed.")
+                    log.info("Notifications resumed via Telegram /start.")
                 elif text == "/help":
-                    reply("/pause — disable auto-exit\n/resume — enable auto-exit\n/status — current P&L\n/stop — stop the monitor")
+                    reply("/stop — mute all notifications\n/start — resume notifications\n/pause — disable auto-exit\n/resume — enable auto-exit\n/status — current P&L")
         except Exception as exc:
             log.warning("Telegram command listener error: %s", exc)
             time.sleep(5)
