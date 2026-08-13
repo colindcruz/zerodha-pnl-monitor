@@ -59,7 +59,7 @@ def run():
 
     # Step 2: Submit TOTP
     totp_code = pyotp.TOTP(TOTP_SECRET).now()
-    resp = session.post(
+    session.post(
         "https://kite.zerodha.com/api/twofa",
         data={
             "user_id": USER_ID,
@@ -67,16 +67,32 @@ def run():
             "twofa_value": totp_code,
             "twofa_type": "totp",
         },
+        timeout=15,
+    )
+    print("TOTP verified.")
+
+    # Step 3: Follow OAuth flow — stop before the final redirect to 127.0.0.1
+    resp = session.get(
+        f"https://kite.zerodha.com/connect/login?api_key={API_KEY}&v=3",
         allow_redirects=False,
         timeout=15,
     )
+    # Follow redirects manually until we hit the callback URL with request_token
+    for _ in range(5):
+        location = resp.headers.get("Location", "")
+        params = parse_qs(urlparse(location).query)
+        request_token = params.get("request_token", [None])[0]
+        if request_token:
+            break
+        if not location or "127.0.0.1" in location or location.startswith("/callback"):
+            # Extract token from this URL directly
+            request_token = params.get("request_token", [None])[0]
+            break
+        resp = session.get(location if location.startswith("http") else f"https://kite.zerodha.com{location}",
+                           allow_redirects=False, timeout=15)
 
-    # Step 3: Extract request_token from redirect URL
-    location = resp.headers.get("Location", "")
-    params = parse_qs(urlparse(location).query)
-    request_token = params.get("request_token", [None])[0]
     if not request_token:
-        raise Exception(f"Could not get request_token. Redirect: {location}")
+        raise Exception(f"Could not get request_token. Last redirect: {location}")
     print(f"Got request_token: {request_token[:8]}...")
 
     # Step 4: Exchange for access token
