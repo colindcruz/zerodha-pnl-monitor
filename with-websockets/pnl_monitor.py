@@ -182,6 +182,51 @@ def _fetch_atr(kite: KiteConnect, instrument_token: int, symbol: str) -> float |
         log.warning("ATR fetch failed for %s: %s", symbol, exc)
         return None
 
+def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, float, list]:
+    """Place SL-Limit order at 2x ATR from average entry price."""
+    symbol  = pos["tradingsymbol"]
+    qty     = pos["quantity"]
+    avg     = pos["average_price"]
+    sl_dist = 2 * atr
+
+    if qty > 0:  # LONG — sell SL below entry
+        tx            = kite.TRANSACTION_TYPE_SELL
+        trigger       = round(avg - sl_dist, 1)
+        buffer        = max(1.0, round(trigger * 0.01, 1))
+        limit_price   = round(trigger - buffer, 1)
+    else:        # SHORT — buy SL above entry
+        tx            = kite.TRANSACTION_TYPE_BUY
+        trigger       = round(avg + sl_dist, 1)
+        buffer        = max(1.0, round(trigger * 0.01, 1))
+        limit_price   = round(trigger + buffer, 1)
+
+    lot_sizes = _get_lot_sizes(kite, [symbol])
+    lot_size  = lot_sizes.get(symbol, 1)
+    max_chunk = (FREEZE_QTY_LIMIT // lot_size) * lot_size if lot_size > 1 else FREEZE_QTY_LIMIT
+    remaining = abs(qty)
+    order_ids = []
+
+    while remaining > 0:
+        chunk = min(remaining, max_chunk)
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=pos["exchange"],
+            tradingsymbol=symbol,
+            transaction_type=tx,
+            quantity=chunk,
+            product=pos["product"],
+            order_type=kite.ORDER_TYPE_SL,
+            price=limit_price,
+            trigger_price=trigger,
+        )
+        log.info("SL order placed: %s %s qty=%d trigger=%.1f limit=%.1f order_id=%s",
+                 tx, symbol, chunk, trigger, limit_price, order_id)
+        order_ids.append(order_id)
+        remaining -= chunk
+
+    return trigger, limit_price, order_ids
+
+
 def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
     """Fetch lot sizes for a list of NFO tradingsymbols."""
     try:
@@ -530,9 +575,17 @@ def main():
                                 direction = "LONG" if pos["quantity"] > 0 else "SHORT"
                                 atr = _fetch_atr(kite, token, pos["tradingsymbol"])
                                 atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
+                                sl_line = ""
+                                if atr:
+                                    try:
+                                        trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr)
+                                        sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price}"
+                                    except Exception as exc:
+                                        log.error("SL order failed for %s: %s", pos["tradingsymbol"], exc)
+                                        sl_line = f"SL order FAILED: {exc}"
                                 notify(
                                     f"📐 New position: {pos['tradingsymbol']}",
-                                    f"{direction} {abs(pos['quantity'])} qty\n{atr_line}",
+                                    f"{direction} {abs(pos['quantity'])} qty\n{atr_line}\n{sl_line}".strip(),
                                 )
                 last_position_refresh = now
 
