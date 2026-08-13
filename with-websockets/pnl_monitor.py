@@ -132,11 +132,12 @@ def send_telegram(text: str):
 def send_ntfy(title: str, body: str, priority: str = "default"):
     if not NTFY_TOPIC:
         return
+    from urllib.parse import quote
     try:
         resp = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=body.encode(),
-            headers={"Title": title, "Priority": priority},
+            data=body.encode("utf-8"),
+            headers={"Title": quote(title), "Priority": priority},
             timeout=10,
         )
         if not resp.ok:
