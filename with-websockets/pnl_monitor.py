@@ -1004,11 +1004,6 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
 def main():
     log.info("P&L monitor (WebSocket) started.")
 
-    # Wait until market opens if we're launched early
-    while not is_market_open():
-        log.info("Market closed. Sleeping 60 s.")
-        time.sleep(60)
-
     try:
         access_token = _read_access_token()
     except RuntimeError as exc:
@@ -1021,12 +1016,18 @@ def main():
 
     tracker = PositionTracker(kite)
 
-    # Start Telegram command listener in background
+    # Start Telegram command listener in background — before the market-open
+    # wait below, so /status etc. respond even in the pre-market window.
     tracker_ref = [tracker]
     kite_ref = [kite]
     cmd_thread = threading.Thread(target=_telegram_command_listener, args=(tracker_ref, kite_ref), daemon=True)
     cmd_thread.start()
     log.info("Telegram command listener started.")
+
+    # Wait until market opens if we're launched early
+    while not is_market_open():
+        log.info("Market closed. Sleeping 60 s.")
+        time.sleep(60)
 
     if not tracker.instrument_tokens():
         log.warning("No open positions found. The script will keep watching and "
