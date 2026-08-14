@@ -13,14 +13,15 @@ from kiteconnect import KiteConnect
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / ".env")
 
 API_KEY            = os.environ["KITE_API_KEY"]
 API_SECRET         = os.environ["KITE_API_SECRET"]
 USER_ID            = os.environ["ZERODHA_USER_ID"]
 PASSWORD           = os.environ["ZERODHA_PASSWORD"]
 TOTP_SECRET        = os.environ["ZERODHA_TOTP_SECRET"]
-ACCESS_TOKEN_PATH  = Path(os.getenv("ACCESS_TOKEN_PATH", ".access_token"))
+ACCESS_TOKEN_PATH  = SCRIPT_DIR / os.getenv("ACCESS_TOKEN_PATH", ".access_token")
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
