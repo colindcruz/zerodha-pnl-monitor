@@ -87,6 +87,27 @@ def sl_orders_enabled() -> bool:
 HEDGE_PRICE_THRESHOLD   = float(os.getenv("HEDGE_PRICE_THRESHOLD", "5.0"))  # positions with LTP below this are kept
 EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait this long below floor before exiting
 
+# ---- NIFTY short strangle (auto) ----
+STRANGLE_ENABLED             = os.getenv("STRANGLE_ENABLED", "true").lower() == "true"
+STRANGLE_ENTRY_TIME          = (9, 20)   # HH, MM IST — entry window opens
+STRANGLE_ENTRY_CUTOFF        = (9, 35)   # entry window closes; give up + alert if not done by then
+STRANGLE_EXIT_TIME           = (15, 0)   # HH, MM IST — square off any legs still open
+STRANGLE_STRIKE_OFFSET       = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))    # 1-strike-OTM on NIFTY's 50-pt strikes
+STRANGLE_SL_MULTIPLIER       = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.5"))  # regime-dependent (backtested 2.0-3.0x) — tune via /set, not a fixed truth
+STRANGLE_LOTS                = int(os.getenv("STRANGLE_LOTS", "1"))
+STRANGLE_PRODUCT             = "MIS"
+STRANGLE_ENTRY_BUFFER_PCT    = float(os.getenv("STRANGLE_ENTRY_BUFFER_PCT", "0.01"))
+STRANGLE_ENTRY_RETRY_SECONDS = int(os.getenv("STRANGLE_ENTRY_RETRY_SECONDS", "20"))
+STRANGLE_ENTRY_MAX_RETRIES   = int(os.getenv("STRANGLE_ENTRY_MAX_RETRIES", "3"))
+
+PAUSE_STRANGLE_FILE = Path("pause_strangle")  # touch this file to stop future days' auto-entry
+
+def strangle_entries_enabled() -> bool:
+    """Returns False if the pause file exists — lets you stop strangle auto-entry without restart."""
+    return STRANGLE_ENABLED and not PAUSE_STRANGLE_FILE.exists()
+
+STRANGLE_STATE_FILE = Path(os.getenv("STRANGLE_STATE_FILE", "strangle_state.json"))
+
 # ---- Profit target exit ----
 PROFIT_TARGET           = float(os.getenv("PROFIT_TARGET", "80000"))   # exit all non-hedge positions when P&L hits this
 
@@ -136,6 +157,46 @@ def is_market_open() -> bool:
         return False
     t = (now.hour, now.minute)
     return MARKET_OPEN <= t <= MARKET_CLOSE
+
+
+# ---- Strangle state (date-keyed, survives restarts — see reconcile_strangle_state_on_startup) ----
+
+def _default_leg() -> dict:
+    return {
+        "tradingsymbol": None, "instrument_token": None, "strike": None,
+        "lot_size": None, "qty": None,
+        "entry_order_id": None, "entry_status": "pending",  # pending|order_placed|filled|failed
+        "entry_price": None,
+        "sl_order_id": None, "sl_trigger": None,
+        "status": "pending",  # pending|open|sl_hit|closed_eod|closed_manual|closed_other|failed
+        "exit_price": None, "closed_at": None,
+    }
+
+
+def _default_strangle_state(today: str) -> dict:
+    return {
+        "date": today, "entry_attempted": False, "entry_completed": False, "skip_today": False,
+        "spot_at_entry": None, "expiry": None,
+        "legs": {"CE": _default_leg(), "PE": _default_leg()},
+        "eod_square_off_attempted": False, "eod_square_off_completed": False,
+    }
+
+
+def load_strangle_state() -> dict:
+    """Load today's strangle state; a stale (yesterday's) date is discarded in favor of fresh defaults."""
+    today = date.today().isoformat()
+    if STRANGLE_STATE_FILE.exists():
+        try:
+            state = json.loads(STRANGLE_STATE_FILE.read_text())
+            if state.get("date") == today:
+                return state
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return _default_strangle_state(today)
+
+
+def save_strangle_state(state: dict) -> None:
+    STRANGLE_STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 logging.basicConfig(
@@ -328,6 +389,490 @@ def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
     except Exception as exc:
         log.warning("Could not fetch lot sizes: %s — defaulting to 1", exc)
         return {}
+
+
+def _resolve_strangle_legs(kite: KiteConnect) -> dict | None:
+    """
+    Resolves today's 1-strike-OTM NIFTY strangle: current spot, ATM strike, and the
+    exact CE/PE tradingsymbols for the nearest expiry. Uses "earliest expiry >= today
+    across all NIFTY option rows" rather than a weekday assumption (NSE's weekly-expiry
+    weekday has changed before and could again) — a monthly contract's expiry is always
+    itself the final weekly expiry of that month, so this is correct regardless of
+    whatever cadence is in effect. Returns None (and logs why) if spot or either strike
+    can't be resolved — never guesses a nearby strike.
+    """
+    try:
+        spot = kite.ltp([INDEX_SPOT_SYMBOLS["NIFTY"]])[INDEX_SPOT_SYMBOLS["NIFTY"]]["last_price"]
+    except Exception as exc:
+        log.error("Could not fetch NIFTY spot for strangle resolution: %s", exc)
+        return None
+
+    atm = round(spot / STRANGLE_STRIKE_OFFSET) * STRANGLE_STRIKE_OFFSET
+    ce_strike = atm + STRANGLE_STRIKE_OFFSET
+    pe_strike = atm - STRANGLE_STRIKE_OFFSET
+
+    try:
+        instruments = kite.instruments("NFO")
+    except Exception as exc:
+        log.error("Could not fetch NFO instruments for strangle resolution: %s", exc)
+        return None
+
+    today = date.today()
+
+    def _norm_expiry(i):
+        e = i["expiry"]
+        return e.date() if isinstance(e, datetime) else e
+
+    nifty_options = [i for i in instruments if i["name"] == "NIFTY" and i["instrument_type"] in ("CE", "PE")]
+    upcoming_expiries = sorted({_norm_expiry(i) for i in nifty_options if _norm_expiry(i) >= today})
+    if not upcoming_expiries:
+        log.error("No upcoming NIFTY option expiry found — cannot resolve strangle.")
+        return None
+    expiry = upcoming_expiries[0]
+
+    def _find(strike, opt_type):
+        for i in nifty_options:
+            if _norm_expiry(i) == expiry and float(i["strike"]) == strike and i["instrument_type"] == opt_type:
+                return {
+                    "tradingsymbol": i["tradingsymbol"],
+                    "instrument_token": i["instrument_token"],
+                    "strike": float(i["strike"]),
+                    "lot_size": int(i["lot_size"]),
+                }
+        return None
+
+    ce = _find(ce_strike, "CE")
+    pe = _find(pe_strike, "PE")
+    if not ce or not pe:
+        log.error("Could not resolve strangle legs for expiry %s: CE %s found=%s, PE %s found=%s",
+                   expiry, ce_strike, bool(ce), pe_strike, bool(pe))
+        return None
+
+    return {"expiry": expiry.isoformat(), "spot": spot, "CE": ce, "PE": pe}
+
+
+def _place_strangle_leg_order(kite: KiteConnect, leg: dict, transaction_type: str, buffer_pct: float) -> list:
+    """
+    Aggressive LIMIT order (LTP +/- buffer_pct) for one strangle leg — entry (SELL) or
+    exit (BUY), chunked around FREEZE_QTY_LIMIT the same way _place_sl_order/
+    exit_non_hedge_positions do. Returns the list of order_id(s) placed.
+    """
+    symbol = leg["tradingsymbol"]
+    lot_size = leg["lot_size"]
+    qty = lot_size * STRANGLE_LOTS
+
+    ltp_data = kite.ltp([f"NFO:{symbol}"])
+    ltp = ltp_data[f"NFO:{symbol}"]["last_price"]
+    buffer = max(1.0, round(ltp * buffer_pct, 1))
+    limit_price = round(ltp - buffer if transaction_type == kite.TRANSACTION_TYPE_SELL else ltp + buffer, 1)
+
+    max_chunk = (FREEZE_QTY_LIMIT // lot_size) * lot_size if lot_size > 1 else FREEZE_QTY_LIMIT
+    remaining = qty
+    order_ids = []
+    while remaining > 0:
+        chunk = min(remaining, max_chunk)
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange="NFO",
+            tradingsymbol=symbol,
+            transaction_type=transaction_type,
+            quantity=chunk,
+            product=STRANGLE_PRODUCT,
+            order_type=kite.ORDER_TYPE_LIMIT,
+            price=limit_price,
+        )
+        log.info("Strangle leg order: %s %s qty=%d limit=%.1f order_id=%s", transaction_type, symbol, chunk, limit_price, order_id)
+        order_ids.append(order_id)
+        remaining -= chunk
+    return order_ids
+
+
+def _place_strangle_sl_order(kite: KiteConnect, leg: dict, trigger: float) -> list:
+    """SL-LIMIT BUY to close a short strangle leg at trigger = entry_price * STRANGLE_SL_MULTIPLIER."""
+    symbol = leg["tradingsymbol"]
+    lot_size = leg["lot_size"]
+    qty = lot_size * STRANGLE_LOTS
+
+    buffer = min(10.0, max(1.0, round(trigger * 0.01, 1)))
+    limit_price = round(trigger + buffer, 1)  # buying to close a short, so limit sits above trigger
+
+    max_chunk = (FREEZE_QTY_LIMIT // lot_size) * lot_size if lot_size > 1 else FREEZE_QTY_LIMIT
+    remaining = qty
+    order_ids = []
+    while remaining > 0:
+        chunk = min(remaining, max_chunk)
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange="NFO",
+            tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_BUY,
+            quantity=chunk,
+            product=STRANGLE_PRODUCT,
+            order_type=kite.ORDER_TYPE_SL,
+            price=limit_price,
+            trigger_price=round(trigger, 1),
+        )
+        log.info("Strangle SL order: BUY %s qty=%d trigger=%.1f limit=%.1f order_id=%s", symbol, chunk, trigger, limit_price, order_id)
+        order_ids.append(order_id)
+        remaining -= chunk
+    return order_ids
+
+
+def enter_strangle(kite: KiteConnect, tracker: "PositionTracker") -> None:
+    """
+    Orchestrates the 9:20am strangle entry: resolves strikes, places SELL LIMIT orders
+    for both legs, retries any unfilled leg with a widening buffer, and gives up with
+    an urgent alert if the entry window closes before both legs fill. Deliberately never
+    auto-corrects an asymmetric fill (one leg filled, one not) and never escalates to a
+    MARKET order — both are explicit product decisions, not oversights.
+    """
+    with tracker.strangle_lock:
+        state = tracker.strangle_state
+        if state.get("entry_completed"):
+            log.info("Strangle entry already completed today — skipping.")
+            return
+
+    legs = _resolve_strangle_legs(kite)
+    if legs is None:
+        notify("🚨 Strangle entry FAILED", "Could not resolve strikes/expiry — no strangle entered today. Check logs.", priority="urgent")
+        return
+
+    with tracker.strangle_lock:
+        state["spot_at_entry"] = legs["spot"]
+        state["expiry"] = legs["expiry"]
+        for leg_key in ("CE", "PE"):
+            info = legs[leg_key]
+            leg = state["legs"][leg_key]
+            leg["tradingsymbol"] = info["tradingsymbol"]
+            leg["instrument_token"] = info["instrument_token"]
+            leg["strike"] = info["strike"]
+            leg["lot_size"] = info["lot_size"]
+            leg["qty"] = info["lot_size"] * STRANGLE_LOTS
+            tracker.strangle_symbols.add(info["tradingsymbol"])
+        save_strangle_state(state)
+
+    log.info("Strangle legs resolved: spot=%.2f expiry=%s CE=%s PE=%s",
+              legs["spot"], legs["expiry"], legs["CE"]["tradingsymbol"], legs["PE"]["tradingsymbol"])
+
+    for leg_key in ("CE", "PE"):
+        leg = state["legs"][leg_key]
+        try:
+            order_ids = _place_strangle_leg_order(kite, leg, kite.TRANSACTION_TYPE_SELL, STRANGLE_ENTRY_BUFFER_PCT)
+            with tracker.strangle_lock:
+                leg["entry_order_id"] = order_ids[0] if len(order_ids) == 1 else order_ids
+                leg["entry_status"] = "order_placed"
+                save_strangle_state(state)
+        except Exception as exc:
+            log.error("Failed to place strangle %s entry order: %s", leg_key, exc)
+            with tracker.strangle_lock:
+                leg["entry_status"] = "failed"
+                save_strangle_state(state)
+            notify(f"🚨 Strangle {leg_key} entry order FAILED", f"{leg['tradingsymbol']}: {exc}", priority="urgent")
+
+    notify(
+        "🦅 Strangle entry orders placed",
+        f"SOLD {state['legs']['CE']['tradingsymbol']} & {state['legs']['PE']['tradingsymbol']}\n"
+        f"Spot: Rs {legs['spot']:.2f} | Expiry: {legs['expiry']}\nAwaiting fill confirmation...",
+    )
+
+    # Retry loop: widen the limit buffer for any leg still unfilled, up to STRANGLE_ENTRY_MAX_RETRIES.
+    for attempt in range(1, STRANGLE_ENTRY_MAX_RETRIES + 1):
+        time.sleep(STRANGLE_ENTRY_RETRY_SECONDS)
+        now_ist = datetime.now(IST)
+        cutoff = now_ist.replace(hour=STRANGLE_ENTRY_CUTOFF[0], minute=STRANGLE_ENTRY_CUTOFF[1], second=0, microsecond=0)
+        if now_ist >= cutoff:
+            break
+        with tracker.strangle_lock:
+            unfilled = [k for k, l in state["legs"].items() if l["entry_status"] == "order_placed"]
+        if not unfilled:
+            break
+        for leg_key in unfilled:
+            leg = state["legs"][leg_key]
+            try:
+                _cancel_open_orders(kite, [leg["tradingsymbol"]])
+                order_ids = _place_strangle_leg_order(
+                    kite, leg, kite.TRANSACTION_TYPE_SELL, STRANGLE_ENTRY_BUFFER_PCT * (attempt + 1)
+                )
+                with tracker.strangle_lock:
+                    leg["entry_order_id"] = order_ids[0] if len(order_ids) == 1 else order_ids
+                    save_strangle_state(state)
+                log.info("Strangle %s entry retried (attempt %d), wider buffer.", leg_key, attempt)
+            except Exception as exc:
+                log.error("Strangle %s entry retry failed: %s", leg_key, exc)
+
+    # Give up on anything still unfilled once retries/window are exhausted.
+    with tracker.strangle_lock:
+        still_unfilled = [k for k, l in state["legs"].items() if l["entry_status"] != "filled"]
+        if still_unfilled:
+            for leg_key in still_unfilled:
+                if state["legs"][leg_key]["entry_status"] != "filled":
+                    state["legs"][leg_key]["entry_status"] = "failed"
+            save_strangle_state(state)
+    if still_unfilled:
+        filled = [k for k in ("CE", "PE") if k not in still_unfilled]
+        notify(
+            "🚨 Strangle entry INCOMPLETE",
+            f"Gave up after {STRANGLE_ENTRY_MAX_RETRIES} retries. "
+            f"Filled: {', '.join(filled) if filled else 'none'} | Unfilled: {', '.join(still_unfilled)}\n"
+            f"No MARKET fallback, no auto-correction of the other leg — check /strangle_status and decide manually.",
+            priority="urgent",
+        )
+
+
+def _on_strangle_leg_filled(kite: KiteConnect, tracker: "PositionTracker", data: dict) -> None:
+    """
+    Dedicated fill handler for strangle-owned symbols, dispatched from on_order_update
+    instead of the legacy ATR/Turtle path (see the exclusion branch there). SELL fill =
+    entry (places the premium-multiple SL using the real fill price, not an estimate);
+    BUY fill = exit — SL hit, EOD square-off, manual close, or swept up by a global
+    stop mechanism (loss limit/trailing/profit target), labeled by matching order_id.
+
+    Note: for a chunked entry (STRANGLE_LOTS large enough to exceed FREEZE_QTY_LIMIT),
+    only the first chunk's fill sets entry_price/places the SL — matching this file's
+    existing acceptance of not specially handling partial/multi-chunk fills elsewhere.
+    Irrelevant at the default STRANGLE_LOTS=1 (no chunking occurs).
+    """
+    symbol = data.get("tradingsymbol")
+    txn = data.get("transaction_type")
+    order_id = data.get("order_id")
+    try:
+        avg_price = float(data.get("average_price") or 0)
+    except (TypeError, ValueError):
+        avg_price = 0.0
+
+    with tracker.strangle_lock:
+        state = tracker.strangle_state
+        leg_key = next((k for k, l in state["legs"].items() if l.get("tradingsymbol") == symbol), None)
+        if leg_key is None:
+            log.warning("Strangle fill for unrecognized symbol %s — ignoring.", symbol)
+            return
+        leg = state["legs"][leg_key]
+
+        if txn == "SELL" and leg["entry_status"] != "filled":
+            leg["entry_price"] = avg_price
+            leg["entry_status"] = "filled"
+            leg["status"] = "open"
+            trigger = round(avg_price * STRANGLE_SL_MULTIPLIER, 1)
+            try:
+                sl_order_ids = _place_strangle_sl_order(kite, leg, trigger)
+                leg["sl_order_id"] = sl_order_ids[0] if len(sl_order_ids) == 1 else sl_order_ids
+                leg["sl_trigger"] = trigger
+                notify(f"✅ Strangle {leg_key} filled", f"{symbol} SOLD @ Rs {avg_price:.2f} | SL trigger Rs {trigger:.2f}")
+            except Exception as exc:
+                log.error("Strangle %s SL placement FAILED: %s", leg_key, exc)
+                notify(
+                    f"🚨 Strangle {leg_key} SL PLACEMENT FAILED",
+                    f"{symbol} filled @ Rs {avg_price:.2f} but the SL order failed: {exc}\nNAKED POSITION — act manually.",
+                    priority="urgent",
+                )
+            if all(l["entry_status"] == "filled" for l in state["legs"].values()):
+                state["entry_completed"] = True
+
+        elif txn == "BUY" and leg["status"] == "open":
+            leg["exit_price"] = avg_price
+            leg["closed_at"] = datetime.now(IST).isoformat()
+            sl_ids = leg.get("sl_order_id")
+            sl_ids = sl_ids if isinstance(sl_ids, list) else [sl_ids]
+            if order_id in sl_ids:
+                leg["status"] = "sl_hit"
+                notify(
+                    f"🛑 Strangle {leg_key} SL HIT",
+                    f"{symbol} bought back @ Rs {avg_price:.2f} (trigger was Rs {leg['sl_trigger']:.2f})",
+                    priority="high",
+                )
+            elif order_id in tracker.strangle_manual_exit_order_ids:
+                leg["status"] = "closed_manual"
+                notify(f"✅ Strangle {leg_key} closed (manual)", f"{symbol} bought back @ Rs {avg_price:.2f}")
+            elif order_id in tracker.strangle_eod_exit_order_ids:
+                leg["status"] = "closed_eod"
+                notify(f"🕒 Strangle {leg_key} squared off (3pm)", f"{symbol} bought back @ Rs {avg_price:.2f}")
+            else:
+                leg["status"] = "closed_other"
+                notify(
+                    f"⚠️ Strangle {leg_key} closed via unrecognized order",
+                    f"{symbol} bought back @ Rs {avg_price:.2f} — likely swept up by a global stop "
+                    "(loss limit/trailing/profit target).",
+                    priority="high",
+                )
+        save_strangle_state(state)
+
+
+def square_off_strangle(kite: KiteConnect, tracker: "PositionTracker", reason: str) -> tuple[list, list]:
+    """
+    Closes any strangle leg still actually open. reason is "eod" or "manual" — used only
+    to label the placed exit order so _on_strangle_leg_filled can attribute the fill
+    correctly. Verifies against live kite.positions() rather than trusting persisted
+    status alone, since a very recent SL hit might not have reached the fill handler yet.
+    """
+    with tracker.strangle_lock:
+        state = tracker.strangle_state
+        legs_snapshot = {k: dict(v) for k, v in state["legs"].items()}
+
+    try:
+        live = {p["tradingsymbol"]: p for p in kite.positions().get("net", []) if p["quantity"] != 0}
+    except Exception as exc:
+        log.error("square_off_strangle: could not fetch live positions: %s", exc)
+        notify("🚨 Strangle square-off FAILED", f"Could not fetch live positions: {exc}", priority="urgent")
+        return [], []
+
+    closed, skipped = [], []
+    for leg_key, leg in legs_snapshot.items():
+        symbol = leg.get("tradingsymbol")
+        if not symbol:
+            continue
+        if leg["status"] != "open":
+            skipped.append(symbol)
+            continue
+        pos = live.get(symbol)
+        if not pos:
+            log.warning("Strangle leg %s marked open but flat in live positions — leaving to fill handler.", symbol)
+            skipped.append(symbol)
+            continue
+        try:
+            _cancel_open_orders(kite, [symbol])  # pulls the resting SL first, avoids a double-exit race
+            order_ids = _place_strangle_leg_order(kite, leg, kite.TRANSACTION_TYPE_BUY, STRANGLE_ENTRY_BUFFER_PCT)
+            target_set = tracker.strangle_eod_exit_order_ids if reason == "eod" else tracker.strangle_manual_exit_order_ids
+            target_set.update(order_ids)
+            closed.append(symbol)
+        except Exception as exc:
+            log.error("Failed to square off strangle leg %s: %s", symbol, exc)
+            notify(f"🚨 Strangle {leg_key} square-off FAILED", f"{symbol}: {exc}", priority="urgent")
+
+    if reason == "eod":
+        with tracker.strangle_lock:
+            state["eod_square_off_completed"] = True
+            save_strangle_state(state)
+
+    lines = []
+    if closed:
+        lines.append(f"Closed: {', '.join(closed)}")
+    if skipped:
+        lines.append(f"Skipped (already closed, or flat): {', '.join(skipped)}")
+    notify(
+        "🕒 Strangle squared off (3pm)" if reason == "eod" else "✅ Strangle closed (manual)",
+        "\n".join(lines) if lines else "Nothing to close.",
+    )
+    return closed, skipped
+
+
+def reconcile_strangle_state_on_startup(kite: KiteConnect, tracker: "PositionTracker") -> None:
+    """
+    Runs once at process start, right after PositionTracker construction. Systemd
+    auto-restarts this bot on crash, so a mid-day restart is a real scenario, not a
+    hypothetical — this never trusts strangle_state.json blindly, always cross-checks
+    against kite.positions()/kite.orders() before deciding whether today's entry is
+    pending, in-flight, or complete. This is the highest financial-risk function in the
+    whole feature; ambiguous states are alerted, never silently guessed or retried.
+    """
+    with tracker.strangle_lock:
+        state = tracker.strangle_state
+        for leg in state["legs"].values():
+            if leg.get("tradingsymbol"):
+                tracker.strangle_symbols.add(leg["tradingsymbol"])
+        has_legs = any(l.get("tradingsymbol") for l in state["legs"].values())
+
+    if not has_legs:
+        log.info("Strangle reconciliation: no legs resolved yet today, nothing to reconcile.")
+        return
+
+    try:
+        live_positions = {p["tradingsymbol"]: p for p in kite.positions().get("net", []) if p["quantity"] != 0}
+    except Exception as exc:
+        log.error("Strangle reconciliation: could not fetch live positions: %s", exc)
+        notify("🚨 Strangle reconciliation FAILED", f"Could not fetch live positions on restart: {exc}. Check /strangle_status manually.", priority="urgent")
+        return
+
+    try:
+        live_orders = kite.orders()
+    except Exception as exc:
+        log.warning("Strangle reconciliation: could not fetch orders: %s", exc)
+        live_orders = []
+
+    changed = False
+    with tracker.strangle_lock:
+        for leg_key, leg in state["legs"].items():
+            symbol = leg.get("tradingsymbol")
+            if not symbol:
+                continue
+            live_pos = live_positions.get(symbol)
+
+            if live_pos and leg["status"] in ("pending", "open"):
+                # Genuinely open — trust it, backfill anything the crash interrupted.
+                if leg["entry_status"] != "filled":
+                    leg["entry_price"] = live_pos["average_price"]
+                    leg["entry_status"] = "filled"
+                    leg["status"] = "open"
+                    changed = True
+                resting_sl = next(
+                    (o for o in live_orders if o.get("tradingsymbol") == symbol
+                     and o.get("status") in ("OPEN", "TRIGGER PENDING") and o.get("transaction_type") == "BUY"),
+                    None,
+                )
+                if resting_sl:
+                    if leg.get("sl_order_id") != resting_sl["order_id"]:
+                        leg["sl_order_id"] = resting_sl["order_id"]
+                        leg["sl_trigger"] = float(resting_sl.get("trigger_price") or 0) or leg.get("sl_trigger")
+                        changed = True
+                    notify(
+                        f"🔄 Strangle {leg_key} reconciled",
+                        f"{symbol} open @ Rs {leg['entry_price']:.2f}, SL confirmed resting at Rs {leg.get('sl_trigger')}.",
+                        priority="high",
+                    )
+                else:
+                    # NAKED leg — no resting stop found. Place one immediately.
+                    trigger = round(leg["entry_price"] * STRANGLE_SL_MULTIPLIER, 1)
+                    try:
+                        sl_order_ids = _place_strangle_sl_order(kite, leg, trigger)
+                        leg["sl_order_id"] = sl_order_ids[0] if len(sl_order_ids) == 1 else sl_order_ids
+                        leg["sl_trigger"] = trigger
+                        changed = True
+                        notify(
+                            f"🚨 Strangle {leg_key} was NAKED on restart",
+                            f"{symbol} open @ Rs {leg['entry_price']:.2f} with no resting SL — placed fresh SL @ Rs {trigger:.2f}.",
+                            priority="urgent",
+                        )
+                    except Exception as exc:
+                        notify(
+                            f"🚨 Strangle {leg_key} NAKED and SL placement FAILED",
+                            f"{symbol} open @ Rs {leg['entry_price']:.2f}, no SL, and placing one failed: {exc}\nACT MANUALLY NOW.",
+                            priority="urgent",
+                        )
+
+            elif not live_pos and leg["status"] == "open":
+                # Closed while the bot was down (SL hit, or closed manually elsewhere).
+                leg["status"] = "closed_other"
+                leg["closed_at"] = datetime.now(IST).isoformat()
+                changed = True
+                notify(
+                    f"⚠️ Strangle {leg_key} closed while bot was down",
+                    f"{symbol} is now flat — closed via SL or manual action during the restart.",
+                    priority="high",
+                )
+
+            elif not live_pos and leg["status"] == "pending" and leg.get("entry_order_id"):
+                order_id = leg["entry_order_id"]
+                order_id = order_id[-1] if isinstance(order_id, list) else order_id
+                matching = next((o for o in live_orders if o.get("order_id") == order_id), None)
+                if matching is None:
+                    pass  # nothing to reconcile against; the normal entry/retry flow will handle it
+                elif matching.get("status") == "COMPLETE":
+                    leg["entry_price"] = float(matching.get("average_price") or 0)
+                    leg["entry_status"] = "filled"
+                    leg["status"] = "open"
+                    changed = True
+                elif matching.get("status") in ("REJECTED", "CANCELLED"):
+                    leg["entry_status"] = "failed"
+                    changed = True
+                    notify(
+                        f"🚨 Strangle {leg_key} entry was rejected/cancelled before restart",
+                        f"{symbol}: order {order_id} status {matching.get('status')}. No auto-retry — check /strangle_status.",
+                        priority="urgent",
+                    )
+                # else still OPEN/TRIGGER PENDING — leave as attempted; the normal fill path (or a
+                # fresh enter_strangle call, since entry_completed is still False) will pick it up.
+
+        if changed:
+            save_strangle_state(state)
 
 
 def _cancel_open_orders(kite: KiteConnect, symbols: list[str]) -> int:
@@ -649,6 +1194,16 @@ class PositionTracker:
         # (e.g. one order split into several by the exchange) don't race each other.
         self.sl_order_lock = threading.Lock()
 
+        # Auto-strangle state. strangle_symbols is checked by on_order_update to route
+        # fills away from the legacy ATR/Turtle SL path — populated before any strangle
+        # order is placed (see enter_strangle) so there's no window where an early fill
+        # could slip through to the wrong handler.
+        self.strangle_state = load_strangle_state()
+        self.strangle_symbols: set[str] = set()
+        self.strangle_lock = threading.Lock()
+        self.strangle_manual_exit_order_ids: set[str] = set()
+        self.strangle_eod_exit_order_ids: set[str] = set()
+
         self.refresh_positions()
 
     def refresh_positions(self):
@@ -804,6 +1359,49 @@ def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -
     return "\n".join(lines)
 
 
+def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str:
+    """Today's strangle: expiry/spot at entry, and per-leg symbol/entry/current LTP/SL/status."""
+    with tracker.strangle_lock:
+        state = dict(tracker.strangle_state)
+        legs = {k: dict(v) for k, v in state["legs"].items()}
+
+    if not state.get("entry_attempted"):
+        msg = "📐 STRANGLE — not entered today yet."
+        if state.get("skip_today"):
+            msg += " (skip_today is set — today's entry will be skipped)"
+        return msg
+
+    lines = [f"📐 STRANGLE — {state['date']}"]
+    spot = state.get("spot_at_entry")
+    lines.append(f"Expiry: {state.get('expiry') or 'n/a'}" + (f"  |  Spot at entry: Rs {spot:.2f}" if spot else ""))
+
+    symbols = [l["tradingsymbol"] for l in legs.values() if l.get("tradingsymbol")]
+    live_ltp = {}
+    if symbols:
+        try:
+            ltp_data = kite.ltp([f"NFO:{s}" for s in symbols])
+            live_ltp = {s: ltp_data.get(f"NFO:{s}", {}).get("last_price") for s in symbols}
+        except Exception as exc:
+            log.warning("Could not fetch live LTP for strangle status: %s", exc)
+
+    for leg_key, leg in legs.items():
+        if not leg.get("tradingsymbol"):
+            lines.append(f"{leg_key}: not resolved")
+            continue
+        cur = live_ltp.get(leg["tradingsymbol"])
+        cur_str = f"Rs {cur:.2f}" if cur is not None else "n/a"
+        entry_str = f"Rs {leg['entry_price']:.2f}" if leg.get("entry_price") is not None else "pending"
+        sl_str = f"Rs {leg['sl_trigger']:.2f}" if leg.get("sl_trigger") is not None else "none"
+        lines.append(f"{leg_key} {leg['tradingsymbol']}: entry {entry_str} | now {cur_str} | SL {sl_str} | {leg['status']}")
+
+    lines.append("")
+    entry_state = "completed" if state.get("entry_completed") else "incomplete"
+    eod_state = "done" if state.get("eod_square_off_completed") else ("attempted" if state.get("eod_square_off_attempted") else "pending")
+    lines.append(f"Entry: {entry_state}  |  EOD square-off: {eod_state}")
+    lines.append(f"Auto-entry: {'PAUSED' if PAUSE_STRANGLE_FILE.exists() else 'enabled'}  |  SL multiplier: {STRANGLE_SL_MULTIPLIER}x")
+    return "\n".join(lines)
+
+
 # ---- Daily history / EOD summary ----
 
 def _load_history() -> list:
@@ -888,6 +1486,8 @@ SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
     "max_position_qty": ("MAX_POSITION_QTY", int),
     "hedge_price_threshold": ("HEDGE_PRICE_THRESHOLD", float),
     "exit_buffer_seconds": ("EXIT_BUFFER_SECONDS", int),
+    "strangle_sl_multiplier": ("STRANGLE_SL_MULTIPLIER", float),
+    "strangle_lots": ("STRANGLE_LOTS", int),
 }
 
 
@@ -932,6 +1532,11 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
       /resume     — enable auto-exit (removes pause file)
       /pause_sl   — stop placing/resizing protective SL orders (creates pause file)
       /resume_sl  — resume placing protective SL orders (removes pause file)
+      /strangle_status  — today's auto-strangle: legs, entry/current price, SL, status
+      /skip_strangle    — skip today's strangle entry (only before it's been attempted)
+      /close_strangle   — square off any open strangle leg right now
+      /pause_strangle   — stop future days' strangle auto-entry (creates pause file)
+      /resume_strangle  — resume strangle auto-entry (removes pause file)
       /status     — send current P&L snapshot
       /greeks     — send portfolio delta/theta/vega
     """
@@ -978,6 +1583,41 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                     PAUSE_SL_FILE.unlink(missing_ok=True)
                     reply("▶️ SL-order placement RESUMED.")
                     log.info("SL-order placement resumed via Telegram.")
+                elif text == "/strangle_status":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    kite = kite_ref[0] if kite_ref else None
+                    if tracker and kite:
+                        reply(format_strangle_status(kite, tracker))
+                    else:
+                        reply("Monitor not ready yet.")
+                elif text == "/skip_strangle":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    if not tracker:
+                        reply("Monitor not ready yet.")
+                    elif tracker.strangle_state.get("entry_attempted"):
+                        reply("Too late — today's entry was already attempted. Use /close_strangle to exit early instead.")
+                    else:
+                        with tracker.strangle_lock:
+                            tracker.strangle_state["skip_today"] = True
+                            save_strangle_state(tracker.strangle_state)
+                        reply("⏭ Today's strangle entry will be skipped.")
+                        log.info("Strangle entry skipped for today via Telegram.")
+                elif text == "/close_strangle":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    kite = kite_ref[0] if kite_ref else None
+                    if tracker and kite:
+                        reply("Closing any open strangle legs...")
+                        threading.Thread(target=lambda: square_off_strangle(kite, tracker, "manual"), daemon=True).start()
+                    else:
+                        reply("Monitor not ready yet.")
+                elif text == "/pause_strangle":
+                    PAUSE_STRANGLE_FILE.touch()
+                    reply("⏸ Strangle auto-entry PAUSED for future days. Send /resume_strangle to re-enable.")
+                    log.info("Strangle auto-entry paused via Telegram.")
+                elif text == "/resume_strangle":
+                    PAUSE_STRANGLE_FILE.unlink(missing_ok=True)
+                    reply("▶️ Strangle auto-entry RESUMED.")
+                    log.info("Strangle auto-entry resumed via Telegram.")
                 elif text == "/status":
                     tracker = tracker_ref[0] if tracker_ref else None
                     if tracker:
@@ -1014,6 +1654,11 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                         "/resume — enable auto-exit\n"
                         "/pause_sl — stop placing protective SL orders\n"
                         "/resume_sl — resume placing protective SL orders\n"
+                        "/strangle_status — today's auto-strangle: legs, entry/current price, SL, status\n"
+                        "/skip_strangle — skip today's strangle entry (before it's been attempted)\n"
+                        "/close_strangle — square off any open strangle leg right now\n"
+                        "/pause_strangle — stop future days' strangle auto-entry\n"
+                        "/resume_strangle — resume strangle auto-entry\n"
                         "/status — full status (P&L, floors, headroom, pause/mute state)\n"
                         "/greeks — portfolio delta/theta/vega by underlying\n"
                         "/history — last 7 days' EOD P&L summary\n"
@@ -1041,6 +1686,7 @@ def main():
     kite.set_access_token(access_token)
 
     tracker = PositionTracker(kite)
+    reconcile_strangle_state_on_startup(kite, tracker)
 
     # Start Telegram command listener in background — before the market-open
     # wait below, so /status etc. respond even in the pre-market window.
@@ -1112,6 +1758,14 @@ def main():
             except (TypeError, ValueError):
                 token = None
             if exchange != "NFO" or not symbol or qty <= 0 or not token:
+                return
+
+            # Strangle-owned fills never touch the legacy ATR/Turtle SL path below —
+            # they're routed to their own handler with their own premium-multiple SL.
+            # A symbol stays in strangle_symbols for the rest of the day even after the
+            # leg closes, so a stray late duplicate fill can't fall through here either.
+            if symbol in tracker.strangle_symbols:
+                threading.Thread(target=_on_strangle_leg_filled, args=(kite, tracker, data), daemon=True).start()
                 return
 
             d = qty if txn == "BUY" else -qty
@@ -1202,6 +1856,27 @@ def main():
             total_pnl, details = tracker.compute_pnl()
             tracker.session_peak_pnl = max(tracker.session_peak_pnl, total_pnl)
             tracker.session_trough_pnl = min(tracker.session_trough_pnl, total_pnl)
+
+            # ---- Strangle entry (9:20-9:35 window) and 3pm square-off ----
+            now_ist = datetime.now(IST)
+            strangle_entry_start = now_ist.replace(hour=STRANGLE_ENTRY_TIME[0], minute=STRANGLE_ENTRY_TIME[1], second=0, microsecond=0)
+            strangle_entry_cutoff = now_ist.replace(hour=STRANGLE_ENTRY_CUTOFF[0], minute=STRANGLE_ENTRY_CUTOFF[1], second=0, microsecond=0)
+            strangle_exit_time = now_ist.replace(hour=STRANGLE_EXIT_TIME[0], minute=STRANGLE_EXIT_TIME[1], second=0, microsecond=0)
+
+            if (strangle_entries_enabled()
+                    and strangle_entry_start <= now_ist < strangle_entry_cutoff
+                    and not tracker.strangle_state.get("entry_attempted")
+                    and not tracker.strangle_state.get("skip_today")):
+                tracker.strangle_state["entry_attempted"] = True
+                save_strangle_state(tracker.strangle_state)  # persist BEFORE dispatch — avoids a double-fire next tick
+                threading.Thread(target=enter_strangle, args=(kite, tracker), daemon=True).start()
+
+            if (now_ist >= strangle_exit_time
+                    and tracker.strangle_state.get("entry_completed")
+                    and not tracker.strangle_state.get("eod_square_off_attempted")):
+                tracker.strangle_state["eod_square_off_attempted"] = True
+                save_strangle_state(tracker.strangle_state)
+                threading.Thread(target=lambda: square_off_strangle(kite, tracker, "eod"), daemon=True).start()
 
             # ---- EOD summary: fires once, the first loop iteration after market close ----
             if not eod_summary_sent and not is_market_open():

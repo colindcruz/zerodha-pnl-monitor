@@ -1,6 +1,7 @@
 .env
 .access_token
 alert_state.json
+strangle_state.json
 pnl_monitor.log
 __pycache__/
 *.pyc
