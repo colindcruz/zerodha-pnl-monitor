@@ -37,7 +37,7 @@ LOG_FILE = Path(os.getenv("LOG_FILE", "pnl_monitor.log"))
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = (9, 15)   # HH, MM
-MARKET_CLOSE = (15, 45)  # options can be bought/sold until 15:45 even though the market is only partially open past 15:30
+MARKET_CLOSE = (15, 40)
 
 # ---------------------------------------------------------------------------
 # Logging

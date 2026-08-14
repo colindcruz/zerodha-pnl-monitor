@@ -115,7 +115,7 @@ HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "pnl_history.json"))
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN  = (9, 15)
-MARKET_CLOSE = (15, 45)  # options can be bought/sold until 15:45 even though the market is only partially open past 15:30
+MARKET_CLOSE = (15, 40)
 
 # ============================================================
 
