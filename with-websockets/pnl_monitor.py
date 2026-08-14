@@ -76,6 +76,14 @@ def auto_exit_enabled() -> bool:
     if PAUSE_FILE.exists():
         return False
     return AUTO_EXIT
+
+# ---- Protective SL-order placement ----
+PAUSE_SL_FILE = Path("pause_sl_orders")  # touch this file to temporarily stop placing/resizing SL orders
+
+def sl_orders_enabled() -> bool:
+    """Returns False if the pause file exists — lets you stop SL-order placement without restart."""
+    return not PAUSE_SL_FILE.exists()
+
 HEDGE_PRICE_THRESHOLD   = float(os.getenv("HEDGE_PRICE_THRESHOLD", "5.0"))  # positions with LTP below this are kept
 EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait this long below floor before exiting
 
@@ -275,6 +283,11 @@ def _ensure_sl_order(kite: KiteConnect, tracker: "PositionTracker", token: int, 
     calls, so callers on the websocket thread should dispatch it via a background thread.
     """
     symbol = pos["tradingsymbol"]
+
+    if not sl_orders_enabled():
+        log.info("SL-order placement paused — skipping %s.", symbol)
+        return
+
     price = pos.get("last_price") or pos.get("average_price", 0)
     if price < HEDGE_PRICE_THRESHOLD:
         return  # hedge leg — never auto-protected, same exclusion auto-exit uses
@@ -780,6 +793,7 @@ def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -
 
     lines.append("")
     lines.append(f"Auto-exit: {'PAUSED' if PAUSE_FILE.exists() else 'enabled'}")
+    lines.append(f"SL orders: {'PAUSED' if PAUSE_SL_FILE.exists() else 'enabled'}")
     lines.append(f"Notifications: {'MUTED' if MUTE_FILE.exists() else 'on'}")
 
     if details:
@@ -914,10 +928,12 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
     Background thread that polls Telegram for commands and acts on them.
     tracker_ref/kite_ref are one-element lists so we can access objects created after this thread starts.
     Supported commands:
-      /pause   — disable auto-exit (creates pause file)
-      /resume  — enable auto-exit (removes pause file)
-      /status  — send current P&L snapshot
-      /greeks  — send portfolio delta/theta/vega
+      /pause      — disable auto-exit (creates pause file)
+      /resume     — enable auto-exit (removes pause file)
+      /pause_sl   — stop placing/resizing protective SL orders (creates pause file)
+      /resume_sl  — resume placing protective SL orders (removes pause file)
+      /status     — send current P&L snapshot
+      /greeks     — send portfolio delta/theta/vega
     """
     url_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     offset = 0
@@ -954,6 +970,14 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                     PAUSE_FILE.unlink(missing_ok=True)
                     reply("▶️ Auto-exit RESUMED.")
                     log.info("Auto-exit resumed via Telegram.")
+                elif text == "/pause_sl":
+                    PAUSE_SL_FILE.touch()
+                    reply("⏸ SL-order placement PAUSED. Send /resume_sl to re-enable.")
+                    log.info("SL-order placement paused via Telegram.")
+                elif text == "/resume_sl":
+                    PAUSE_SL_FILE.unlink(missing_ok=True)
+                    reply("▶️ SL-order placement RESUMED.")
+                    log.info("SL-order placement resumed via Telegram.")
                 elif text == "/status":
                     tracker = tracker_ref[0] if tracker_ref else None
                     if tracker:
@@ -988,6 +1012,8 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                         "/start — resume notifications\n"
                         "/pause — disable auto-exit\n"
                         "/resume — enable auto-exit\n"
+                        "/pause_sl — stop placing protective SL orders\n"
+                        "/resume_sl — resume placing protective SL orders\n"
                         "/status — full status (P&L, floors, headroom, pause/mute state)\n"
                         "/greeks — portfolio delta/theta/vega by underlying\n"
                         "/history — last 7 days' EOD P&L summary\n"
