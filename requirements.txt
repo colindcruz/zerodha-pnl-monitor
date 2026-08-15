@@ -4,3 +4,7 @@ requests>=2.31.0
 # Required by auto_token.py's unattended daily login (hard `import pyotp`, no fallback).
 # Also used for generate_token.py's optional automated-login path.
 pyotp>=2.9.0
+
+# NOTE: live-dashboard/ is a separate process with its own venv and its own
+# requirements.txt (aiohttp + kiteconnect + python-dotenv) — it does not share this
+# file or this venv with the trading bot. See live-dashboard/requirements.txt.

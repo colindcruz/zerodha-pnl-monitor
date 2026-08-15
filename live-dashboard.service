@@ -1,0 +1,20 @@
+[Unit]
+Description=Live NIFTY Strangle Dashboard (read-only market-data viewer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pnlmon
+WorkingDirectory=/opt/live-dashboard
+ExecStart=/opt/live-dashboard/venv/bin/python server.py
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=30
+
+# Tighten security surface
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

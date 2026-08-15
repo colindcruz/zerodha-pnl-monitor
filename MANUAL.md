@@ -486,6 +486,98 @@ Other files:
 | `check_positions.py`, `debug_pnl.py`, `exit_position.py`, `snapshot.py` | Small standalone developer/debugging utilities — not part of the live monitor's runtime, safe to ignore for normal operation |
 | `bhavcopy_fetcher.py`, `bhavcopy_cache/` | Historical options-data tooling used for backtesting new strategies — unrelated to live monitoring |
 | `test_*.py` | Developer test/dry-run scripts, not run automatically — useful if you're modifying the code yourself |
+| `live-dashboard/` | A **separate, independent** read-only live market-data viewer (own process, own venv, own `.env`) — see section 11. Not part of the trading bot. |
+| `live-dashboard.service`, `Caddyfile` | systemd unit + reverse-proxy config for deploying the live dashboard — see section 11.3 |
+
+---
+
+## 11. Live dashboard
+
+`live-dashboard/` is a **separate, independent process** — not part of the trading bot,
+does not touch `strangle_state.json`/`hedge_state.json`, and cannot place orders. It's a
+read-only viewer: live CE/PE option prices with a candle-timeframe selector (1/2/3/5
+min) and strike dropdowns, reachable from any browser.
+
+> ⚠️ It reads the **same** `.access_token` the trading bot uses (via
+> `ACCESS_TOKEN_PATH`), so it needs `auto_token.py`'s daily refresh to also restart it —
+> already wired in (see 11.1). If you deploy this on a box that doesn't run the bot,
+> point `ACCESS_TOKEN_PATH` at a token file kept fresh some other way.
+
+### 11.1 What it is
+
+- `live-dashboard/server.py` — an `aiohttp` server: password-protected login (signed
+  session cookie), a cached NIFTY-options instrument lookup, a thin proxy to Kite's
+  historical-candle API for one-time backfill, and a WebSocket that relays live ticks
+  for whichever strikes the browser currently has selected (with real subscribe/
+  unsubscribe on strike change — unlike the bot's own ticker, which never unsubscribes).
+- `live-dashboard/dashboard.html` — the browser page. All candle bucketing happens
+  **client-side**, from 1-minute base candles (backfilled once via `/api/historical`,
+  extended live from ticks), merged into the selected timeframe. Bucket boundaries are
+  anchored to 09:15 IST using a fixed-offset clock calculation — correct regardless of
+  the viewer's own timezone, not just "whatever timezone the browser happens to be in."
+- `live-dashboard/login.html` — the login page.
+- Binds to `127.0.0.1:8765` only. It is **never** directly reachable from outside the
+  droplet — see 11.3 for how it's exposed.
+
+### 11.2 First-time setup
+
+1. `mkdir -p /opt/live-dashboard && cd /opt/live-dashboard`
+2. Copy `live-dashboard/server.py`, `dashboard.html`, `login.html`, and
+   `requirements.txt` from this repo into that directory (same deploy method you already
+   use for `/opt/pnl-monitor` — see section 3).
+3. `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
+4. Copy `live-dashboard/.env.example` to `/opt/live-dashboard/.env` and fill in:
+   - `KITE_API_KEY` — same value as the bot's `.env`.
+   - `ACCESS_TOKEN_PATH` — path to the bot's `.access_token` (default assumes
+     `/opt/live-dashboard/../.access_token` won't resolve across separate deploy
+     directories — set an explicit absolute path, e.g. `/opt/pnl-monitor/.access_token`).
+   - `DASHBOARD_PASSWORD` — the login password.
+   - `DASHBOARD_SESSION_SECRET` — generate with
+     `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+5. Install the systemd unit: copy `live-dashboard.service` to
+   `/etc/systemd/system/live-dashboard.service`, then
+   `systemctl daemon-reload && systemctl enable --now live-dashboard`.
+6. Confirm `auto_token.py`'s daily run restarts it too — it already calls
+   `systemctl restart live-dashboard` (non-fatal if that service isn't installed on a
+   given box) after refreshing the token, right after restarting `pnl-monitor`.
+
+### 11.3 Exposing it over HTTPS (no domain needed)
+
+Since `server.py` only binds `127.0.0.1`, something has to terminate TLS and proxy to
+it. This project uses **Caddy** with a free `nip.io` hostname — `nip.io` resolves
+`157-245-102-152.nip.io` straight to `157.245.102.152` with zero DNS setup, which is
+enough for Caddy to get a real Let's Encrypt certificate (no browser warning, unlike a
+self-signed cert):
+
+1. Install Caddy on the droplet (see caddyserver.com's install docs for your distro).
+2. Copy `Caddyfile` (repo root) to `/etc/caddy/Caddyfile`.
+3. Make sure ports 80 and 443 are open (`ufw allow 80,443/tcp` if using `ufw`) — 80 is
+   needed for the ACME HTTP-01 challenge, Caddy handles the HTTP→HTTPS redirect itself.
+4. `systemctl restart caddy`.
+5. Visit `https://157-245-102-152.nip.io` — you should land on the login page with a
+   valid padlock.
+
+If the droplet's IP ever changes, update the hostname in `Caddyfile` to match, and
+rotate `DASHBOARD_PASSWORD`/`DASHBOARD_SESSION_SECRET` while you're at it.
+
+### 11.4 Using it
+
+- **Strike dropdowns** default to 7-strikes-OTM (350 points) on each side and re-follow
+  the ATM strike automatically as it drifts — until you manually pick a strike, at which
+  point your pick sticks (for that browser session) until you change it again or reload
+  the page.
+- **Candle timeframe** (1/2/3/5 min) is remembered in the browser's `localStorage`
+  across reloads.
+- The connection badge in the header reads **Live** / **Reconnecting…** — the dashboard
+  auto-reconnects with backoff and resubscribes to whatever's currently selected.
+- Outside 09:15–15:40 IST, a banner explains the market's closed and prices shown are
+  the last available.
+
+### 11.5 Explicitly out of scope
+
+No P&L, no alerting, no order placement — this dashboard only ever reads market data.
+If you want live P&L on it too, that's a separate feature to design (it would need to
+know your actual entry fills, which this process currently has no access to).
 
 ---
 

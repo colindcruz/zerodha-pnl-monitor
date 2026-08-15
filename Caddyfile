@@ -1,0 +1,13 @@
+# Reverse proxy for the live dashboard — gets a real Let's Encrypt certificate for
+# free with no domain purchase, by using nip.io's wildcard DNS-to-IP service as the
+# hostname. 157-245-102-152.nip.io resolves to 157.245.102.152 with zero DNS setup;
+# Caddy requests and renews the cert automatically via the HTTP-01 challenge, which
+# needs port 80 reachable in addition to 443 (used only for the ACME handshake and to
+# redirect stray HTTP traffic — Caddy does this redirect itself, nothing to add here).
+#
+# If the droplet's IP ever changes, update the hostname below to match (and revisit
+# the DASHBOARD_PASSWORD / session secret — a new IP with the old nip.io host pointing
+# nowhere is a good moment to rotate them anyway).
+157-245-102-152.nip.io {
+	reverse_proxy 127.0.0.1:8765
+}

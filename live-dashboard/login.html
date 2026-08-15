@@ -1,0 +1,98 @@
+<!doctype html>
+<title>Strangle Monitor — Sign in</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f7f6f2;
+    --surface-1: #fcfcfb;
+    --surface-2: #ffffff;
+    --border: #e4e2da;
+    --border-soft: #edece5;
+    --text-primary: #17160f;
+    --text-secondary: #57564c;
+    --text-muted: #8b897c;
+    --combined: #159a68;
+    --bad: #c23b2e;
+    --shadow: 0 1px 2px rgba(23,22,15,0.04), 0 6px 20px rgba(23,22,15,0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface-0: #131311;
+      --surface-1: #1a1a19;
+      --surface-2: #201f1c;
+      --border: #34332c;
+      --border-soft: #2a2a25;
+      --text-primary: #f5f4ee;
+      --text-secondary: #c3c2b7;
+      --text-muted: #8b897c;
+      --combined: #199e70;
+      --bad: #e35b4d;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-family: -apple-system, "Segoe UI", "Inter", system-ui, sans-serif;
+  }
+  .card {
+    width: 100%;
+    max-width: 320px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    padding: 28px 26px;
+    margin: 20px;
+  }
+  .eyebrow {
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  h1 { font-size: 19px; font-weight: 700; margin: 2px 0 20px; }
+  label { display: block; font-size: 12.5px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+  input[type="password"] {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    color: var(--text-primary);
+    margin-bottom: 14px;
+  }
+  input[type="password"]:focus { outline: 2px solid var(--combined); outline-offset: 1px; }
+  button {
+    width: 100%;
+    background: var(--combined);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.05); }
+  .error { color: var(--bad); font-size: 12.5px; font-weight: 600; margin: -6px 0 14px; }
+</style>
+<div class="card">
+  <div class="eyebrow">Auto-strangle · Live monitor</div>
+  <h1>Sign in</h1>
+  <form method="post" action="/login">
+    <!--ERROR-->
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autofocus required>
+    <button type="submit">Sign in</button>
+  </form>
+</div>

@@ -109,6 +109,16 @@ def run():
     subprocess.run(["systemctl", "restart", "pnl-monitor"], check=True)
     print("Monitor restarted.")
 
+    # Step 7: Restart the live dashboard too, if it's installed — it holds its own
+    # Kite session (same access token file) and needs a fresh KiteTicker connection
+    # every morning just like the monitor does. Not fatal if this service doesn't
+    # exist on a given box (e.g. dashboard not deployed there).
+    dashboard_restarted = subprocess.run(
+        ["systemctl", "restart", "live-dashboard"], check=False,
+    ).returncode == 0
+    if dashboard_restarted:
+        print("Live dashboard restarted.")
+
     notify("✅ Token generated & monitor restarted. Ready for 9:15 AM.")
 
 
