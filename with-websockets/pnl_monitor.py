@@ -89,12 +89,12 @@ EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait th
 
 # ---- NIFTY short strangle (auto) ----
 STRANGLE_ENABLED             = os.getenv("STRANGLE_ENABLED", "true").lower() == "true"
-STRANGLE_ENTRY_TIME          = (9, 20)   # HH, MM IST — entry window opens
+STRANGLE_ENTRY_TIME          = (9, 23)   # HH, MM IST — entry window opens
 STRANGLE_ENTRY_CUTOFF        = (9, 35)   # entry window closes; give up + alert if not done by then
 STRANGLE_EXIT_TIME           = (15, 0)   # HH, MM IST — square off any legs still open
 STRANGLE_STRIKE_OFFSET       = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))    # 1-strike-OTM on NIFTY's 50-pt strikes
-STRANGLE_SL_MULTIPLIER       = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.5"))  # regime-dependent (backtested 2.0-3.0x) — tune via /set, not a fixed truth
-STRANGLE_LOTS                = int(os.getenv("STRANGLE_LOTS", "1"))
+STRANGLE_SL_MULTIPLIER       = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.0"))  # regime-dependent (backtested 2.0-3.0x, 2.0 had the best combined return/drawdown across both tested years) — tune via /set, not a fixed truth
+STRANGLE_LOTS                = int(os.getenv("STRANGLE_LOTS", "5"))
 STRANGLE_PRODUCT             = "MIS"
 STRANGLE_ENTRY_BUFFER_PCT    = float(os.getenv("STRANGLE_ENTRY_BUFFER_PCT", "0.01"))
 STRANGLE_ENTRY_RETRY_SECONDS = int(os.getenv("STRANGLE_ENTRY_RETRY_SECONDS", "20"))
@@ -456,10 +456,15 @@ def _place_strangle_leg_order(kite: KiteConnect, leg: dict, transaction_type: st
     Aggressive LIMIT order (LTP +/- buffer_pct) for one strangle leg — entry (SELL) or
     exit (BUY), chunked around FREEZE_QTY_LIMIT the same way _place_sl_order/
     exit_non_hedge_positions do. Returns the list of order_id(s) placed.
+
+    Always uses leg["qty"] (fixed once at entry resolution), never the live
+    STRANGLE_LOTS global — a mid-day /set strangle_lots must not resize an order for a
+    leg that's already open (or already has a quantity committed to today's entry),
+    only affect quantity going forward on the *next* day's entry.
     """
     symbol = leg["tradingsymbol"]
     lot_size = leg["lot_size"]
-    qty = lot_size * STRANGLE_LOTS
+    qty = leg["qty"]
 
     ltp_data = kite.ltp([f"NFO:{symbol}"])
     ltp = ltp_data[f"NFO:{symbol}"]["last_price"]
@@ -488,10 +493,13 @@ def _place_strangle_leg_order(kite: KiteConnect, leg: dict, transaction_type: st
 
 
 def _place_strangle_sl_order(kite: KiteConnect, leg: dict, trigger: float) -> list:
-    """SL-LIMIT BUY to close a short strangle leg at trigger = entry_price * STRANGLE_SL_MULTIPLIER."""
+    """
+    SL-LIMIT BUY to close a short strangle leg at trigger = entry_price * STRANGLE_SL_MULTIPLIER.
+    Uses leg["qty"] (fixed at entry), not the live STRANGLE_LOTS — see _place_strangle_leg_order.
+    """
     symbol = leg["tradingsymbol"]
     lot_size = leg["lot_size"]
-    qty = lot_size * STRANGLE_LOTS
+    qty = leg["qty"]
 
     buffer = min(10.0, max(1.0, round(trigger * 0.01, 1)))
     limit_price = round(trigger + buffer, 1)  # buying to close a short, so limit sits above trigger
@@ -896,16 +904,19 @@ def _cancel_open_orders(kite: KiteConnect, symbols: list[str]) -> int:
     return cancelled
 
 
-def exit_non_hedge_positions(kite: KiteConnect) -> tuple[list, list, list]:
+def exit_non_hedge_positions(kite: KiteConnect, exclude_symbols: frozenset = frozenset()) -> tuple[list, list, list]:
     """
     Limit-exit all open positions with LTP >= HEDGE_PRICE_THRESHOLD.
     Cancels any pending orders for those symbols first to avoid double-exits.
     Exits sold legs (short) first, then bought legs (long).
     Splits large orders into chunks to stay within exchange freeze limits.
+    exclude_symbols are skipped entirely (not even reported as hedges/skipped) — used
+    to keep the auto-strangle feature's positions independent of these account-wide
+    exits, since they're managed by their own SL/3pm logic instead.
     Returns (exited_symbols, skipped_symbols, failed_symbols).
     """
     data = kite.positions()
-    net = [p for p in data.get("net", []) if p["quantity"] != 0]
+    net = [p for p in data.get("net", []) if p["quantity"] != 0 and p["tradingsymbol"] not in exclude_symbols]
 
     sold_legs   = [p for p in net if p["quantity"] < 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
     bought_legs = [p for p in net if p["quantity"] > 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
@@ -1207,17 +1218,28 @@ class PositionTracker:
         self.refresh_positions()
 
     def refresh_positions(self):
-        """Pull the latest open positions (day + net) from Kite REST API."""
+        """
+        Pull the latest open positions (day + net) from Kite REST API. Strangle-owned
+        symbols are excluded entirely here — they're tracked independently via
+        strangle_state, so they never contribute to total_pnl/details (compute_pnl
+        reads from self.positions + self.realized_pnl), never get swept by the global
+        loss-limit/trailing/profit-target/green-day exit checks (which act on whatever
+        this method surfaces), and never re-enter the legacy ATR SL safety-net loop.
+        """
         try:
             data = self.kite.positions()
             net = data.get("net", [])
+            with self.strangle_lock:
+                excluded = frozenset(self.strangle_symbols)
             with self.lock:
                 self.positions = {
-                    p["instrument_token"]: p for p in net if p["quantity"] != 0
+                    p["instrument_token"]: p for p in net
+                    if p["quantity"] != 0 and p["tradingsymbol"] not in excluded
                 }
-                # Realized P&L from positions closed earlier today
+                # Realized P&L from positions closed earlier today (strangle-owned excluded too)
                 self.realized_pnl = sum(
-                    float(p.get("pnl", 0)) for p in net if p["quantity"] == 0
+                    float(p.get("pnl", 0)) for p in net
+                    if p["quantity"] == 0 and p["tradingsymbol"] not in excluded
                 )
             log.info(f"Refreshed positions: {len(self.positions)} open, realized P&L: {self.realized_pnl:.2f}")
         except Exception as e:
@@ -1309,8 +1331,13 @@ def format_summary(total_pnl, details):
     return "\n".join(lines)
 
 
-def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -> str:
-    """Full status: P&L, active safety-net levels, headroom, and pause/mute state."""
+def format_status(tracker: "PositionTracker", total_pnl: float, details: list, strangle_pnl: float | None = None) -> str:
+    """
+    Full status: P&L, active safety-net levels, headroom, and pause/mute state.
+    total_pnl/details are manual/other-positions only — strangle legs are tracked
+    independently (see refresh_positions) and never enter this stream, so strangle_pnl
+    is shown as its own separate line rather than folded into total_pnl.
+    """
     now_ist = datetime.now(IST)
     close_dt = now_ist.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0)
     remaining = (close_dt - now_ist).total_seconds()
@@ -1321,7 +1348,10 @@ def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -
     )
 
     lines = [f"📊 STATUS — {now_ist.strftime('%H:%M:%S')}"]
-    lines.append(f"P&L: Rs {total_pnl:,.2f}  |  Open positions: {len(details)}")
+    lines.append(f"Manual/other P&L: Rs {total_pnl:,.2f}  |  Open positions: {len(details)}")
+    if strangle_pnl is not None:
+        lines.append(f"Strangle P&L: Rs {strangle_pnl:,.2f}  (see /strangle_status for detail)")
+        lines.append(f"Combined P&L: Rs {total_pnl + strangle_pnl:,.2f}")
     lines.append(close_line)
     lines.append("")
 
@@ -1359,6 +1389,42 @@ def format_status(tracker: "PositionTracker", total_pnl: float, details: list) -
     return "\n".join(lines)
 
 
+def _compute_strangle_pnl(kite: KiteConnect, tracker: "PositionTracker") -> float | None:
+    """
+    Current combined strangle P&L (both legs) — unrealized for legs still open, realized
+    for legs already closed today. Returns None if nothing's been entered today (so
+    callers can distinguish "no strangle today" from "strangle is flat at Rs 0").
+    """
+    with tracker.strangle_lock:
+        legs = {k: dict(v) for k, v in tracker.strangle_state["legs"].items()}
+
+    if not any(l.get("tradingsymbol") for l in legs.values()):
+        return None
+
+    symbols = [l["tradingsymbol"] for l in legs.values() if l.get("tradingsymbol") and l["status"] == "open"]
+    live_ltp = {}
+    if symbols:
+        try:
+            ltp_data = kite.ltp([f"NFO:{s}" for s in symbols])
+            live_ltp = {s: ltp_data.get(f"NFO:{s}", {}).get("last_price") for s in symbols}
+        except Exception as exc:
+            log.warning("Could not fetch live LTP for strangle P&L: %s", exc)
+
+    total = 0.0
+    for leg in legs.values():
+        symbol = leg.get("tradingsymbol")
+        if not symbol or leg.get("entry_price") is None or not leg.get("lot_size"):
+            continue
+        qty = leg["lot_size"] * STRANGLE_LOTS
+        if leg["status"] == "open":
+            cur = live_ltp.get(symbol)
+            if cur is not None:
+                total += (leg["entry_price"] - cur) * qty  # short leg: profit as price falls
+        elif leg.get("exit_price") is not None:
+            total += (leg["entry_price"] - leg["exit_price"]) * qty
+    return total
+
+
 def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str:
     """Today's strangle: expiry/spot at entry, and per-leg symbol/entry/current LTP/SL/status."""
     with tracker.strangle_lock:
@@ -1384,6 +1450,7 @@ def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str
         except Exception as exc:
             log.warning("Could not fetch live LTP for strangle status: %s", exc)
 
+    total_pnl = 0.0
     for leg_key, leg in legs.items():
         if not leg.get("tradingsymbol"):
             lines.append(f"{leg_key}: not resolved")
@@ -1393,7 +1460,14 @@ def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str
         entry_str = f"Rs {leg['entry_price']:.2f}" if leg.get("entry_price") is not None else "pending"
         sl_str = f"Rs {leg['sl_trigger']:.2f}" if leg.get("sl_trigger") is not None else "none"
         lines.append(f"{leg_key} {leg['tradingsymbol']}: entry {entry_str} | now {cur_str} | SL {sl_str} | {leg['status']}")
+        qty = (leg.get("lot_size") or 0) * STRANGLE_LOTS
+        if leg.get("entry_price") is not None and qty:
+            if leg["status"] == "open" and cur is not None:
+                total_pnl += (leg["entry_price"] - cur) * qty
+            elif leg.get("exit_price") is not None:
+                total_pnl += (leg["entry_price"] - leg["exit_price"]) * qty
 
+    lines.append(f"Strangle P&L: Rs {total_pnl:,.2f}")
     lines.append("")
     entry_state = "completed" if state.get("entry_completed") else "incomplete"
     eod_state = "done" if state.get("eod_square_off_completed") else ("attempted" if state.get("eod_square_off_attempted") else "pending")
@@ -1620,9 +1694,11 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                     log.info("Strangle auto-entry resumed via Telegram.")
                 elif text == "/status":
                     tracker = tracker_ref[0] if tracker_ref else None
+                    kite = kite_ref[0] if kite_ref else None
                     if tracker:
                         total_pnl, details = tracker.compute_pnl()
-                        reply(format_status(tracker, total_pnl, details))
+                        strangle_pnl = _compute_strangle_pnl(kite, tracker) if kite else None
+                        reply(format_status(tracker, total_pnl, details, strangle_pnl))
                     else:
                         reply("Monitor not ready yet.")
                 elif text == "/set" or text.startswith("/set "):
@@ -1687,6 +1763,7 @@ def main():
 
     tracker = PositionTracker(kite)
     reconcile_strangle_state_on_startup(kite, tracker)
+    tracker.refresh_positions()  # re-apply the strangle exclusion now that strangle_symbols is populated
 
     # Start Telegram command listener in background — before the market-open
     # wait below, so /status etc. respond even in the pre-market window.
@@ -1975,7 +2052,7 @@ def main():
                 tracker.auto_exited = True
                 log.info("Auto-exit triggered after %ds breach.", EXIT_BUFFER_SECONDS)
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
                     lines = ["🔴 AUTO-EXIT EXECUTED"]
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
@@ -2005,7 +2082,7 @@ def main():
                     tracker.green_day_exited = True
                     log.info("Green day floor Rs %.0f breached — auto-exiting.", GREEN_DAY_FLOOR)
                     try:
-                        exited, skipped, failed = exit_non_hedge_positions(kite)
+                        exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
                         lines = []
                         if exited:
                             lines.append(f"Exited: {', '.join(exited)}")
@@ -2028,7 +2105,7 @@ def main():
                 tracker.profit_target_hit = True
                 log.info("Profit target Rs %.0f hit — auto-exiting.", PROFIT_TARGET)
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
                     lines = []
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
@@ -2072,7 +2149,7 @@ def main():
                 tracker.loss_limit_hit = True
                 log.info("Loss limit Rs %.0f hit — auto-exiting.", LOSS_LIMIT)
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
                     lines = []
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
