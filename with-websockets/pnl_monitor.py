@@ -108,6 +108,35 @@ def strangle_entries_enabled() -> bool:
 
 STRANGLE_STATE_FILE = Path(os.getenv("STRANGLE_STATE_FILE", "strangle_state.json"))
 
+# ---- Weekly NIFTY hedge (auto) ----
+# Buys a far-OTM long CE+PE pair once a week (first trading day on/after Wednesday),
+# held via HEDGE_PRODUCT without being touched daily, through that week's Tuesday
+# expiry (NSE cash-settles automatically — no explicit close needed). Purely additive:
+# the daily short strangle above is completely unchanged by this. Exists to reduce the
+# margin required for the week's short legs — entry fires 5 min before the short legs'
+# own entry so the hedge is already in place when Kite prices that day's SELL margin.
+# NOTE: HEDGE_STRIKE_OFFSET's default is a reasoning-based starting guess at "far
+# enough to be cheap," not tuned against real fills — check actual premiums after the
+# first live entry and adjust via /set hedge_strike_offset. Same caveat as the
+# VIX-ATR multiplier defaults elsewhere in this file.
+HEDGE_ENABLED         = os.getenv("HEDGE_ENABLED", "true").lower() == "true"
+HEDGE_ENTRY_TIME      = (9, 18)   # HH, MM IST — 5 min before STRANGLE_ENTRY_TIME
+HEDGE_ENTRY_CUTOFF    = (9, 30)   # entry window closes; give up + alert if not done by then
+HEDGE_STRIKE_OFFSET   = int(os.getenv("HEDGE_STRIKE_OFFSET", "1000"))  # far-OTM, NIFTY 50-pt strikes
+HEDGE_LOTS            = int(os.getenv("HEDGE_LOTS", "5"))
+HEDGE_PRODUCT         = "NRML"
+HEDGE_ENTRY_BUFFER_PCT    = float(os.getenv("HEDGE_ENTRY_BUFFER_PCT", "0.01"))
+HEDGE_ENTRY_RETRY_SECONDS = int(os.getenv("HEDGE_ENTRY_RETRY_SECONDS", "20"))
+HEDGE_ENTRY_MAX_RETRIES   = int(os.getenv("HEDGE_ENTRY_MAX_RETRIES", "3"))
+
+PAUSE_HEDGE_FILE = Path("pause_hedge")  # touch this file to stop future weeks' auto-entry
+
+def hedge_entries_enabled() -> bool:
+    """Returns False if the pause file exists — lets you stop hedge auto-entry without restart."""
+    return HEDGE_ENABLED and not PAUSE_HEDGE_FILE.exists()
+
+HEDGE_STATE_FILE = Path(os.getenv("HEDGE_STATE_FILE", "hedge_state.json"))
+
 # ---- Profit target exit ----
 PROFIT_TARGET           = float(os.getenv("PROFIT_TARGET", "80000"))   # exit all non-hedge positions when P&L hits this
 
@@ -232,6 +261,60 @@ def load_strangle_state() -> dict:
 
 def save_strangle_state(state: dict) -> None:
     STRANGLE_STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ---- Hedge state (expiry-keyed, NOT date-keyed — survives Wed->Tue across restarts,
+# unlike the strangle's state above which is deliberately wiped every new day) ----
+
+def _default_hedge_leg() -> dict:
+    return {
+        "tradingsymbol": None, "instrument_token": None, "strike": None,
+        "lot_size": None, "qty": None,
+        "entry_order_id": None, "entry_status": "pending",  # pending|order_placed|filled|failed
+        "entry_price": None,
+        "status": "pending",  # pending|open|closed_manual|closed_other|failed
+        "exit_price": None, "closed_at": None,
+    }
+
+
+def _week_key(d: date) -> str:
+    """Monday of d's ISO week, as a date string — identifies which weekly cycle a hedge belongs to."""
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def _default_hedge_state(week_key: str) -> dict:
+    return {
+        "week_key": week_key, "entry_attempted": False, "entry_completed": False, "skip_week": False,
+        "spot_at_entry": None, "expiry": None,
+        "legs": {"CE": _default_hedge_leg(), "PE": _default_hedge_leg()},
+    }
+
+
+def load_hedge_state() -> dict:
+    """
+    Load the current hedge state. Unlike load_strangle_state, this is NOT discarded
+    just because it's a new day — a hedge bought Wednesday must still be recognized on
+    Thursday/Friday/Monday/Tuesday. It's only discarded once the held `expiry` has
+    passed (that week's hedge has cash-settled) or there's no `expiry` yet (no hedge
+    ever entered) — in both cases, fresh defaults for the current week are returned so
+    a new entry can be attempted.
+    """
+    today = date.today()
+    if HEDGE_STATE_FILE.exists():
+        try:
+            state = json.loads(HEDGE_STATE_FILE.read_text())
+            expiry_str = state.get("expiry")
+            if expiry_str:
+                expiry = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                if today <= expiry:
+                    return state  # still within the held hedge's life — keep regardless of week_key
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+    return _default_hedge_state(_week_key(today))
+
+
+def save_hedge_state(state: dict) -> None:
+    HEDGE_STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 logging.basicConfig(
@@ -969,6 +1052,388 @@ def reconcile_strangle_state_on_startup(kite: KiteConnect, tracker: "PositionTra
             save_strangle_state(state)
 
 
+# ---- Weekly hedge (independent of the strangle above — see the config block for scope) ----
+
+def _resolve_hedge_legs(kite: KiteConnect) -> dict | None:
+    """
+    Resolves this week's far-OTM NIFTY hedge: current spot, ATM strike, and the exact
+    CE/PE tradingsymbols HEDGE_STRIKE_OFFSET points away on each side, for the nearest
+    expiry (same "earliest expiry >= today" logic as _resolve_strangle_legs — on a
+    Wednesday this naturally resolves to the coming Tuesday). Returns None (and logs
+    why) if spot or either strike can't be resolved — never guesses a nearby strike.
+    """
+    try:
+        spot = kite.ltp([INDEX_SPOT_SYMBOLS["NIFTY"]])[INDEX_SPOT_SYMBOLS["NIFTY"]]["last_price"]
+    except Exception as exc:
+        log.error("Could not fetch NIFTY spot for hedge resolution: %s", exc)
+        return None
+
+    atm = round(spot / STRANGLE_STRIKE_OFFSET) * STRANGLE_STRIKE_OFFSET
+    ce_strike = atm + HEDGE_STRIKE_OFFSET
+    pe_strike = atm - HEDGE_STRIKE_OFFSET
+
+    try:
+        instruments = kite.instruments("NFO")
+    except Exception as exc:
+        log.error("Could not fetch NFO instruments for hedge resolution: %s", exc)
+        return None
+
+    today = date.today()
+
+    def _norm_expiry(i):
+        e = i["expiry"]
+        return e.date() if isinstance(e, datetime) else e
+
+    nifty_options = [i for i in instruments if i["name"] == "NIFTY" and i["instrument_type"] in ("CE", "PE")]
+    upcoming_expiries = sorted({_norm_expiry(i) for i in nifty_options if _norm_expiry(i) >= today})
+    if not upcoming_expiries:
+        log.error("No upcoming NIFTY option expiry found — cannot resolve hedge.")
+        return None
+    expiry = upcoming_expiries[0]
+
+    def _find(strike, opt_type):
+        for i in nifty_options:
+            if _norm_expiry(i) == expiry and float(i["strike"]) == strike and i["instrument_type"] == opt_type:
+                return {
+                    "tradingsymbol": i["tradingsymbol"],
+                    "instrument_token": i["instrument_token"],
+                    "strike": float(i["strike"]),
+                    "lot_size": int(i["lot_size"]),
+                }
+        return None
+
+    ce = _find(ce_strike, "CE")
+    pe = _find(pe_strike, "PE")
+    if not ce or not pe:
+        log.error("Could not resolve hedge legs for expiry %s: CE %s found=%s, PE %s found=%s",
+                   expiry, ce_strike, bool(ce), pe_strike, bool(pe))
+        return None
+
+    return {"expiry": expiry.isoformat(), "spot": spot, "CE": ce, "PE": pe}
+
+
+def _place_hedge_leg_order(kite: KiteConnect, leg: dict, transaction_type: str, buffer_pct: float) -> list:
+    """
+    Aggressive LIMIT order (LTP +/- buffer_pct) for one hedge leg — entry (BUY) or an
+    early manual exit (SELL via /close_hedge), chunked around FREEZE_QTY_LIMIT the same
+    way _place_strangle_leg_order does. Returns the list of order_id(s) placed.
+
+    Always uses leg["qty"] (fixed once at entry resolution), never the live HEDGE_LOTS
+    global — same discipline as the strangle leg's own qty-freeze (see
+    _place_strangle_leg_order's docstring).
+    """
+    symbol = leg["tradingsymbol"]
+    lot_size = leg["lot_size"]
+    qty = leg["qty"]
+
+    ltp_data = kite.ltp([f"NFO:{symbol}"])
+    ltp = ltp_data[f"NFO:{symbol}"]["last_price"]
+    buffer = max(1.0, round(ltp * buffer_pct, 1))
+    limit_price = round(ltp + buffer if transaction_type == kite.TRANSACTION_TYPE_BUY else ltp - buffer, 1)
+
+    max_chunk = (FREEZE_QTY_LIMIT // lot_size) * lot_size if lot_size > 1 else FREEZE_QTY_LIMIT
+    remaining = qty
+    order_ids = []
+    while remaining > 0:
+        chunk = min(remaining, max_chunk)
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange="NFO",
+            tradingsymbol=symbol,
+            transaction_type=transaction_type,
+            quantity=chunk,
+            product=HEDGE_PRODUCT,
+            order_type=kite.ORDER_TYPE_LIMIT,
+            price=limit_price,
+        )
+        log.info("Hedge leg order: %s %s qty=%d limit=%.1f order_id=%s", transaction_type, symbol, chunk, limit_price, order_id)
+        order_ids.append(order_id)
+        remaining -= chunk
+    return order_ids
+
+
+def enter_hedge(kite: KiteConnect, tracker: "PositionTracker") -> None:
+    """
+    Orchestrates the weekly hedge entry: resolves far-OTM strikes, places BUY LIMIT
+    orders for both legs, retries any unfilled leg with a widening buffer, and gives up
+    with an urgent alert if the entry window closes before both legs fill. Mirrors
+    enter_strangle's structure and its deliberate choices: no MARKET fallback, no
+    auto-correction of an asymmetric fill.
+    """
+    with tracker.hedge_lock:
+        state = tracker.hedge_state
+        if state.get("entry_completed"):
+            log.info("Hedge entry already completed this week — skipping.")
+            return
+
+    legs = _resolve_hedge_legs(kite)
+    if legs is None:
+        notify("🚨 Hedge entry FAILED", "Could not resolve strikes/expiry — no hedge entered this week. Check logs.", priority="urgent")
+        return
+
+    with tracker.hedge_lock:
+        state["spot_at_entry"] = legs["spot"]
+        state["expiry"] = legs["expiry"]
+        for leg_key in ("CE", "PE"):
+            info = legs[leg_key]
+            leg = state["legs"][leg_key]
+            leg["tradingsymbol"] = info["tradingsymbol"]
+            leg["instrument_token"] = info["instrument_token"]
+            leg["strike"] = info["strike"]
+            leg["lot_size"] = info["lot_size"]
+            leg["qty"] = info["lot_size"] * HEDGE_LOTS
+            tracker.hedge_symbols.add(info["tradingsymbol"])
+        save_hedge_state(state)
+
+    log.info("Hedge legs resolved: spot=%.2f expiry=%s CE=%s PE=%s",
+              legs["spot"], legs["expiry"], legs["CE"]["tradingsymbol"], legs["PE"]["tradingsymbol"])
+
+    for leg_key in ("CE", "PE"):
+        leg = state["legs"][leg_key]
+        try:
+            order_ids = _place_hedge_leg_order(kite, leg, kite.TRANSACTION_TYPE_BUY, HEDGE_ENTRY_BUFFER_PCT)
+            with tracker.hedge_lock:
+                leg["entry_order_id"] = order_ids[0] if len(order_ids) == 1 else order_ids
+                leg["entry_status"] = "order_placed"
+                save_hedge_state(state)
+        except Exception as exc:
+            log.error("Failed to place hedge %s entry order: %s", leg_key, exc)
+            with tracker.hedge_lock:
+                leg["entry_status"] = "failed"
+                save_hedge_state(state)
+            notify(f"🚨 Hedge {leg_key} entry order FAILED", f"{leg['tradingsymbol']}: {exc}", priority="urgent")
+
+    # Only report legs whose order actually went in — same discipline as the strangle's
+    # entry-placed alert (a per-leg failure must not be papered over).
+    placed = [k for k in ("CE", "PE") if state["legs"][k]["entry_status"] == "order_placed"]
+    if placed:
+        symbols_line = " & ".join(
+            f"{state['legs'][k]['tradingsymbol']} x{state['legs'][k]['qty']}" for k in placed
+        )
+        notify(
+            "🛡️ Hedge entry orders placed",
+            f"BOUGHT {symbols_line}\n"
+            f"Spot: Rs {legs['spot']:.2f} | Expiry: {legs['expiry']}\nAwaiting fill confirmation...",
+        )
+
+    # Retry loop: widen the limit buffer for any leg still unfilled, up to HEDGE_ENTRY_MAX_RETRIES.
+    for attempt in range(1, HEDGE_ENTRY_MAX_RETRIES + 1):
+        time.sleep(HEDGE_ENTRY_RETRY_SECONDS)
+        now_ist = datetime.now(IST)
+        cutoff = now_ist.replace(hour=HEDGE_ENTRY_CUTOFF[0], minute=HEDGE_ENTRY_CUTOFF[1], second=0, microsecond=0)
+        if now_ist >= cutoff:
+            break
+        with tracker.hedge_lock:
+            unfilled = [k for k, l in state["legs"].items() if l["entry_status"] == "order_placed"]
+        if not unfilled:
+            break
+        for leg_key in unfilled:
+            leg = state["legs"][leg_key]
+            try:
+                _cancel_open_orders(kite, [leg["tradingsymbol"]])
+                order_ids = _place_hedge_leg_order(
+                    kite, leg, kite.TRANSACTION_TYPE_BUY, HEDGE_ENTRY_BUFFER_PCT * (attempt + 1)
+                )
+                with tracker.hedge_lock:
+                    leg["entry_order_id"] = order_ids[0] if len(order_ids) == 1 else order_ids
+                    save_hedge_state(state)
+                log.info("Hedge %s entry retried (attempt %d), wider buffer.", leg_key, attempt)
+            except Exception as exc:
+                log.error("Hedge %s entry retry failed: %s", leg_key, exc)
+
+    # Give up on anything still unfilled once retries/window are exhausted.
+    with tracker.hedge_lock:
+        still_unfilled = [k for k, l in state["legs"].items() if l["entry_status"] != "filled"]
+        if still_unfilled:
+            for leg_key in still_unfilled:
+                if state["legs"][leg_key]["entry_status"] != "filled":
+                    state["legs"][leg_key]["entry_status"] = "failed"
+            save_hedge_state(state)
+    if still_unfilled:
+        filled = [k for k in ("CE", "PE") if k not in still_unfilled]
+        notify(
+            "🚨 Hedge entry INCOMPLETE",
+            f"Gave up after {HEDGE_ENTRY_MAX_RETRIES} retries. "
+            f"Filled: {', '.join(filled) if filled else 'none'} | Unfilled: {', '.join(still_unfilled)}\n"
+            f"No MARKET fallback — check /hedge_status and decide manually. This week's short strangle "
+            f"legs still enter normally, just without full margin-reducing hedge protection.",
+            priority="urgent",
+        )
+
+
+def _on_hedge_leg_filled(kite: KiteConnect, tracker: "PositionTracker", data: dict) -> None:
+    """
+    Dedicated fill handler for hedge-owned symbols, dispatched from on_order_update
+    instead of the legacy ATR/Turtle path. BUY fill = entry (records the real fill
+    price; no SL to place, since a bought option's max loss is already capped at the
+    premium paid). SELL fill = an early manual exit via /close_hedge — the hedge is
+    otherwise never proactively sold; it's left to expire and cash-settle on its own.
+    """
+    symbol = data.get("tradingsymbol")
+    txn = data.get("transaction_type")
+    try:
+        avg_price = float(data.get("average_price") or 0)
+    except (TypeError, ValueError):
+        avg_price = 0.0
+
+    with tracker.hedge_lock:
+        state = tracker.hedge_state
+        leg_key = next((k for k, l in state["legs"].items() if l.get("tradingsymbol") == symbol), None)
+        if leg_key is None:
+            log.warning("Hedge fill for unrecognized symbol %s — ignoring.", symbol)
+            return
+        leg = state["legs"][leg_key]
+
+        if txn == "BUY" and leg["entry_status"] != "filled":
+            leg["entry_price"] = avg_price
+            leg["entry_status"] = "filled"
+            leg["status"] = "open"
+            notify(f"✅ Hedge {leg_key} filled", f"{symbol} BOUGHT x{leg['qty']} @ Rs {avg_price:.2f}")
+            if all(l["entry_status"] == "filled" for l in state["legs"].values()):
+                state["entry_completed"] = True
+
+        elif txn == "SELL" and leg["status"] == "open":
+            leg["exit_price"] = avg_price
+            leg["closed_at"] = datetime.now(IST).isoformat()
+            leg["status"] = "closed_manual"
+            notify(f"✅ Hedge {leg_key} closed (manual)", f"{symbol} sold @ Rs {avg_price:.2f}")
+
+        save_hedge_state(state)
+
+
+def close_hedge(kite: KiteConnect, tracker: "PositionTracker") -> tuple[list, list]:
+    """
+    Manual early exit for the current week's hedge (/close_hedge) — sells any leg still
+    actually open. Verifies against live kite.positions() rather than trusting persisted
+    status alone, same discipline as square_off_strangle.
+    """
+    with tracker.hedge_lock:
+        state = tracker.hedge_state
+        legs_snapshot = {k: dict(v) for k, v in state["legs"].items()}
+
+    try:
+        live = {p["tradingsymbol"]: p for p in kite.positions().get("net", []) if p["quantity"] != 0}
+    except Exception as exc:
+        log.error("close_hedge: could not fetch live positions: %s", exc)
+        notify("🚨 Hedge close FAILED", f"Could not fetch live positions: {exc}", priority="urgent")
+        return [], []
+
+    closed, skipped = [], []
+    for leg_key, leg in legs_snapshot.items():
+        symbol = leg.get("tradingsymbol")
+        if not symbol:
+            continue
+        if leg["status"] != "open":
+            skipped.append(symbol)
+            continue
+        pos = live.get(symbol)
+        if not pos:
+            log.warning("Hedge leg %s marked open but flat in live positions — leaving to fill handler.", symbol)
+            skipped.append(symbol)
+            continue
+        try:
+            _cancel_open_orders(kite, [symbol])
+            _place_hedge_leg_order(kite, leg, kite.TRANSACTION_TYPE_SELL, HEDGE_ENTRY_BUFFER_PCT)
+            closed.append(symbol)
+        except Exception as exc:
+            log.error("Failed to close hedge leg %s: %s", symbol, exc)
+            notify(f"🚨 Hedge {leg_key} close FAILED", f"{symbol}: {exc}", priority="urgent")
+
+    lines = []
+    if closed:
+        lines.append(f"Closed: {', '.join(closed)}")
+    if skipped:
+        lines.append(f"Skipped (already closed, or flat): {', '.join(skipped)}")
+    notify("✅ Hedge closed (manual)", "\n".join(lines) if lines else "Nothing to close.")
+    return closed, skipped
+
+
+def reconcile_hedge_state_on_startup(kite: KiteConnect, tracker: "PositionTracker") -> None:
+    """
+    Runs once at process start, right after PositionTracker construction — every
+    restart, not just same-day ones, since the hedge can span the whole Wed->Tue week
+    and this bot restarts daily at 8:45am. Never trusts hedge_state.json blindly,
+    always cross-checks against kite.positions()/kite.orders(). No SL to reconcile
+    (unlike the strangle) since a bought option has no stop to protect.
+    """
+    with tracker.hedge_lock:
+        state = tracker.hedge_state
+        for leg in state["legs"].values():
+            if leg.get("tradingsymbol"):
+                tracker.hedge_symbols.add(leg["tradingsymbol"])
+        has_legs = any(l.get("tradingsymbol") for l in state["legs"].values())
+
+    if not has_legs:
+        log.info("Hedge reconciliation: no legs resolved yet this week, nothing to reconcile.")
+        return
+
+    try:
+        live_positions = {p["tradingsymbol"]: p for p in kite.positions().get("net", []) if p["quantity"] != 0}
+    except Exception as exc:
+        log.error("Hedge reconciliation: could not fetch live positions: %s", exc)
+        notify("🚨 Hedge reconciliation FAILED", f"Could not fetch live positions on restart: {exc}. Check /hedge_status manually.", priority="urgent")
+        return
+
+    try:
+        live_orders = kite.orders()
+    except Exception as exc:
+        log.warning("Hedge reconciliation: could not fetch orders: %s", exc)
+        live_orders = []
+
+    changed = False
+    with tracker.hedge_lock:
+        for leg_key, leg in state["legs"].items():
+            symbol = leg.get("tradingsymbol")
+            if not symbol:
+                continue
+            live_pos = live_positions.get(symbol)
+
+            if live_pos and leg["status"] in ("pending", "open"):
+                # Genuinely open — trust it, backfill anything the crash interrupted.
+                if leg["entry_status"] != "filled":
+                    leg["entry_price"] = live_pos["average_price"]
+                    leg["entry_status"] = "filled"
+                    leg["status"] = "open"
+                    changed = True
+                notify(f"🔄 Hedge {leg_key} reconciled", f"{symbol} open @ Rs {leg['entry_price']:.2f}.")
+
+            elif not live_pos and leg["status"] == "open":
+                # Flat while the bot was down — closed manually, or (near Tuesday) expired/settled.
+                leg["status"] = "closed_other"
+                leg["closed_at"] = datetime.now(IST).isoformat()
+                changed = True
+                notify(
+                    f"⚠️ Hedge {leg_key} closed while bot was down",
+                    f"{symbol} is now flat — closed manually, or expired/settled, during the restart.",
+                    priority="high",
+                )
+
+            elif not live_pos and leg["status"] == "pending" and leg.get("entry_order_id"):
+                order_id = leg["entry_order_id"]
+                order_id = order_id[-1] if isinstance(order_id, list) else order_id
+                matching = next((o for o in live_orders if o.get("order_id") == order_id), None)
+                if matching is None:
+                    pass  # nothing to reconcile against; the normal entry/retry flow will handle it
+                elif matching.get("status") == "COMPLETE":
+                    leg["entry_price"] = float(matching.get("average_price") or 0)
+                    leg["entry_status"] = "filled"
+                    leg["status"] = "open"
+                    changed = True
+                elif matching.get("status") in ("REJECTED", "CANCELLED"):
+                    leg["entry_status"] = "failed"
+                    changed = True
+                    notify(
+                        f"🚨 Hedge {leg_key} entry was rejected/cancelled before restart",
+                        f"{symbol}: order {order_id} status {matching.get('status')}. No auto-retry — check /hedge_status.",
+                        priority="urgent",
+                    )
+                # else still OPEN/TRIGGER PENDING — leave as attempted; the normal fill path (or a
+                # fresh enter_hedge call, since entry_completed is still False) will pick it up.
+
+        if changed:
+            save_hedge_state(state)
+
+
 def _cancel_open_orders(kite: KiteConnect, symbols: list[str]) -> int:
     """Cancel any pending/open orders for the given symbols before placing exit orders."""
     cancelled = 0
@@ -1321,28 +1786,36 @@ class PositionTracker:
         self.strangle_manual_exit_order_ids: set[str] = set()
         self.strangle_eod_exit_order_ids: set[str] = set()
 
+        # Weekly hedge state — independent of the strangle above, own lock since the two
+        # features are unrelated and shouldn't contend on the same lock.
+        self.hedge_state = load_hedge_state()
+        self.hedge_symbols: set[str] = set()
+        self.hedge_lock = threading.Lock()
+
         self.refresh_positions()
 
     def refresh_positions(self):
         """
-        Pull the latest open positions (day + net) from Kite REST API. Strangle-owned
-        symbols are excluded entirely here — they're tracked independently via
-        strangle_state, so they never contribute to total_pnl/details (compute_pnl
-        reads from self.positions + self.realized_pnl), never get swept by the global
-        loss-limit/trailing/profit-target/green-day exit checks (which act on whatever
-        this method surfaces), and never re-enter the legacy ATR SL safety-net loop.
+        Pull the latest open positions (day + net) from Kite REST API. Strangle- and
+        hedge-owned symbols are excluded entirely here — they're tracked independently
+        via strangle_state/hedge_state, so they never contribute to total_pnl/details
+        (compute_pnl reads from self.positions + self.realized_pnl), never get swept by
+        the global loss-limit/trailing/profit-target/green-day exit checks (which act on
+        whatever this method surfaces), and never re-enter the legacy ATR SL safety-net loop.
         """
         try:
             data = self.kite.positions()
             net = data.get("net", [])
             with self.strangle_lock:
                 excluded = frozenset(self.strangle_symbols)
+            with self.hedge_lock:
+                excluded |= frozenset(self.hedge_symbols)
             with self.lock:
                 self.positions = {
                     p["instrument_token"]: p for p in net
                     if p["quantity"] != 0 and p["tradingsymbol"] not in excluded
                 }
-                # Realized P&L from positions closed earlier today (strangle-owned excluded too)
+                # Realized P&L from positions closed earlier today (strangle/hedge-owned excluded too)
                 self.realized_pnl = sum(
                     float(p.get("pnl", 0)) for p in net
                     if p["quantity"] == 0 and p["tradingsymbol"] not in excluded
@@ -1589,6 +2062,56 @@ def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str
     return "\n".join(lines)
 
 
+def format_hedge_status(kite: KiteConnect, tracker: "PositionTracker") -> str:
+    """This week's hedge: expiry/spot at entry, and per-leg symbol/entry/current LTP/status."""
+    with tracker.hedge_lock:
+        state = dict(tracker.hedge_state)
+        legs = {k: dict(v) for k, v in state["legs"].items()}
+
+    if not state.get("entry_attempted"):
+        msg = f"🛡️ HEDGE — not entered this week yet (week of {state.get('week_key', 'n/a')})."
+        if state.get("skip_week"):
+            msg += " (skip_week is set — this week's entry will be skipped)"
+        return msg
+
+    lines = [f"🛡️ HEDGE — week of {state.get('week_key', 'n/a')}"]
+    spot = state.get("spot_at_entry")
+    lines.append(f"Expiry: {state.get('expiry') or 'n/a'}" + (f"  |  Spot at entry: Rs {spot:.2f}" if spot else ""))
+
+    symbols = [l["tradingsymbol"] for l in legs.values() if l.get("tradingsymbol")]
+    live_ltp = {}
+    if symbols:
+        try:
+            ltp_data = kite.ltp([f"NFO:{s}" for s in symbols])
+            live_ltp = {s: ltp_data.get(f"NFO:{s}", {}).get("last_price") for s in symbols}
+        except Exception as exc:
+            log.warning("Could not fetch live LTP for hedge status: %s", exc)
+
+    total_pnl = 0.0
+    for leg_key, leg in legs.items():
+        if not leg.get("tradingsymbol"):
+            lines.append(f"{leg_key}: not resolved")
+            continue
+        cur = live_ltp.get(leg["tradingsymbol"])
+        cur_str = f"Rs {cur:.2f}" if cur is not None else "n/a"
+        entry_str = f"Rs {leg['entry_price']:.2f}" if leg.get("entry_price") is not None else "pending"
+        lines.append(f"{leg_key} {leg['tradingsymbol']}: entry {entry_str} | now {cur_str} | {leg['status']}")
+        qty = leg.get("qty") or 0
+        if leg.get("entry_price") is not None and qty:
+            # Long position — profits as price rises, opposite sign from the strangle's short legs.
+            if leg["status"] == "open" and cur is not None:
+                total_pnl += (cur - leg["entry_price"]) * qty
+            elif leg.get("exit_price") is not None:
+                total_pnl += (leg["exit_price"] - leg["entry_price"]) * qty
+
+    lines.append(f"Hedge P&L: Rs {total_pnl:,.2f}  (expected to usually be negative — it's insurance, not a profit center)")
+    lines.append("")
+    entry_state = "completed" if state.get("entry_completed") else "incomplete"
+    lines.append(f"Entry: {entry_state}")
+    lines.append(f"Auto-entry: {'PAUSED' if PAUSE_HEDGE_FILE.exists() else 'enabled'}  |  Strike offset: {HEDGE_STRIKE_OFFSET}pts  |  Lots: {HEDGE_LOTS}")
+    return "\n".join(lines)
+
+
 # ---- Daily history / EOD summary ----
 
 def _load_history() -> list:
@@ -1681,6 +2204,8 @@ SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
     "atr_vix_sensitivity": ("ATR_VIX_SENSITIVITY", float),
     "atr_min_multiplier": ("ATR_MIN_MULTIPLIER", float),
     "atr_max_multiplier": ("ATR_MAX_MULTIPLIER", float),
+    "hedge_strike_offset": ("HEDGE_STRIKE_OFFSET", int),
+    "hedge_lots": ("HEDGE_LOTS", int),
 }
 
 
@@ -1811,6 +2336,41 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                     PAUSE_STRANGLE_FILE.unlink(missing_ok=True)
                     reply("▶️ Strangle auto-entry RESUMED.")
                     log.info("Strangle auto-entry resumed via Telegram.")
+                elif text == "/hedge_status":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    kite = kite_ref[0] if kite_ref else None
+                    if tracker and kite:
+                        reply(format_hedge_status(kite, tracker))
+                    else:
+                        reply("Monitor not ready yet.")
+                elif text == "/skip_hedge":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    if not tracker:
+                        reply("Monitor not ready yet.")
+                    elif tracker.hedge_state.get("entry_attempted"):
+                        reply("Too late — this week's entry was already attempted. Use /close_hedge to exit early instead.")
+                    else:
+                        with tracker.hedge_lock:
+                            tracker.hedge_state["skip_week"] = True
+                            save_hedge_state(tracker.hedge_state)
+                        reply("⏭ This week's hedge entry will be skipped.")
+                        log.info("Hedge entry skipped for this week via Telegram.")
+                elif text == "/close_hedge":
+                    tracker = tracker_ref[0] if tracker_ref else None
+                    kite = kite_ref[0] if kite_ref else None
+                    if tracker and kite:
+                        reply("Closing any open hedge legs...")
+                        threading.Thread(target=lambda: close_hedge(kite, tracker), daemon=True).start()
+                    else:
+                        reply("Monitor not ready yet.")
+                elif text == "/pause_hedge":
+                    PAUSE_HEDGE_FILE.touch()
+                    reply("⏸ Hedge auto-entry PAUSED for future weeks. Send /resume_hedge to re-enable.")
+                    log.info("Hedge auto-entry paused via Telegram.")
+                elif text == "/resume_hedge":
+                    PAUSE_HEDGE_FILE.unlink(missing_ok=True)
+                    reply("▶️ Hedge auto-entry RESUMED.")
+                    log.info("Hedge auto-entry resumed via Telegram.")
                 elif text == "/status":
                     tracker = tracker_ref[0] if tracker_ref else None
                     kite = kite_ref[0] if kite_ref else None
@@ -1854,6 +2414,11 @@ def _telegram_command_listener(tracker_ref: list, kite_ref: list):
                         "/close_strangle — square off any open strangle leg right now\n"
                         "/pause_strangle — stop future days' strangle auto-entry\n"
                         "/resume_strangle — resume strangle auto-entry\n"
+                        "/hedge_status — this week's hedge: legs, entry/current price, status\n"
+                        "/skip_hedge — skip this week's hedge entry (before it's been attempted)\n"
+                        "/close_hedge — sell any open hedge leg right now\n"
+                        "/pause_hedge — stop future weeks' hedge auto-entry\n"
+                        "/resume_hedge — resume hedge auto-entry\n"
                         "/status — full status (P&L, floors, headroom, pause/mute state)\n"
                         "/greeks — portfolio delta/theta/vega by underlying\n"
                         "/history — last 7 days' EOD P&L summary\n"
@@ -1882,7 +2447,8 @@ def main():
 
     tracker = PositionTracker(kite)
     reconcile_strangle_state_on_startup(kite, tracker)
-    tracker.refresh_positions()  # re-apply the strangle exclusion now that strangle_symbols is populated
+    reconcile_hedge_state_on_startup(kite, tracker)
+    tracker.refresh_positions()  # re-apply the strangle/hedge exclusion now that those symbol sets are populated
 
     # Start Telegram command listener in background — before the market-open
     # wait below, so /status etc. respond even in the pre-market window.
@@ -1964,6 +2530,12 @@ def main():
                 threading.Thread(target=_on_strangle_leg_filled, args=(kite, tracker, data), daemon=True).start()
                 return
 
+            # Same routing discipline for hedge-owned fills — no SL to place for a bought
+            # option, so this just skips the legacy path entirely and updates hedge state.
+            if symbol in tracker.hedge_symbols:
+                threading.Thread(target=_on_hedge_leg_filled, args=(kite, tracker, data), daemon=True).start()
+                return
+
             d = qty if txn == "BUY" else -qty
             with tracker.lock:
                 prev = tracker.live_position.get(symbol, {"qty": 0, "avg_cost": 0.0, "stop_anchor": 0.0})
@@ -2005,7 +2577,7 @@ def main():
 
                 def _enforce_cooloff(sym=symbol):
                     try:
-                        exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                        exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols | tracker.hedge_symbols))
                         lines = []
                         if exited:
                             lines.append(f"Exited: {', '.join(exited)}")
@@ -2080,7 +2652,7 @@ def main():
                             log.warning("Cool-off violation caught by REST safety net: %s — auto squaring off.",
                                         ", ".join(p["tradingsymbol"] for p in new_pos.values()))
                             try:
-                                exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                                exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols | tracker.hedge_symbols))
                                 lines = []
                                 if exited:
                                     lines.append(f"Exited: {', '.join(exited)}")
@@ -2103,8 +2675,27 @@ def main():
             tracker.session_peak_pnl = max(tracker.session_peak_pnl, total_pnl)
             tracker.session_trough_pnl = min(tracker.session_trough_pnl, total_pnl)
 
-            # ---- Strangle entry (9:20-9:35 window) and 3pm square-off ----
+            # ---- Weekly hedge entry (9:18-9:30 window, first trading day on/after Wednesday) ----
+            # Fires 5 min before the strangle's own entry below, so the hedge is already in
+            # place when Kite prices that day's short-leg margin. hedge_state isn't date-keyed
+            # (see load_hedge_state) — entry_attempted only resets once the held expiry has
+            # passed, so this naturally fires once per week and rolls forward across a
+            # Wednesday holiday onto the next trading day without any extra logic here.
             now_ist = datetime.now(IST)
+            hedge_entry_start = now_ist.replace(hour=HEDGE_ENTRY_TIME[0], minute=HEDGE_ENTRY_TIME[1], second=0, microsecond=0)
+            hedge_entry_cutoff = now_ist.replace(hour=HEDGE_ENTRY_CUTOFF[0], minute=HEDGE_ENTRY_CUTOFF[1], second=0, microsecond=0)
+
+            if (hedge_entries_enabled()
+                    and not is_nse_holiday(now_ist.date())
+                    and now_ist.weekday() >= 2  # Wed, Thu, or Fri — allows a Wednesday holiday to roll forward
+                    and hedge_entry_start <= now_ist < hedge_entry_cutoff
+                    and not tracker.hedge_state.get("entry_attempted")
+                    and not tracker.hedge_state.get("skip_week")):
+                tracker.hedge_state["entry_attempted"] = True
+                save_hedge_state(tracker.hedge_state)  # persist BEFORE dispatch — avoids a double-fire next tick
+                threading.Thread(target=enter_hedge, args=(kite, tracker), daemon=True).start()
+
+            # ---- Strangle entry (9:20-9:35 window) and 3pm square-off ----
             strangle_entry_start = now_ist.replace(hour=STRANGLE_ENTRY_TIME[0], minute=STRANGLE_ENTRY_TIME[1], second=0, microsecond=0)
             strangle_entry_cutoff = now_ist.replace(hour=STRANGLE_ENTRY_CUTOFF[0], minute=STRANGLE_ENTRY_CUTOFF[1], second=0, microsecond=0)
             strangle_exit_time = now_ist.replace(hour=STRANGLE_EXIT_TIME[0], minute=STRANGLE_EXIT_TIME[1], second=0, microsecond=0)
@@ -2140,9 +2731,12 @@ def main():
                     and now - last_final_warning_alert >= 30):
                 last_final_warning_alert = now
                 try:
+                    with tracker.hedge_lock:
+                        hedge_syms = frozenset(tracker.hedge_symbols)
                     net = kite.positions().get("net", [])
                     open_symbols = [p["tradingsymbol"] for p in net
-                                     if p["quantity"] != 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
+                                     if p["quantity"] != 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD
+                                     and p["tradingsymbol"] not in hedge_syms]
                 except Exception as exc:
                     log.warning("Final safety-net position check failed: %s", exc)
                     open_symbols = []
@@ -2158,7 +2752,10 @@ def main():
                 final_squareoff_done = True
                 log.info("3:06pm final safety-net square-off firing.")
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    # Deliberately does NOT exclude strangle_symbols — this is the backstop for
+                    # stray strangle legs too. It DOES exclude the weekly hedge, which must
+                    # survive untouched through the week (see the hedge config block).
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.hedge_symbols))
                     lines = []
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
@@ -2272,7 +2869,7 @@ def main():
                 tracker.auto_exited = True
                 log.info("Auto-exit triggered after %ds breach.", EXIT_BUFFER_SECONDS)
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols | tracker.hedge_symbols))
                     cooloff_until = _start_cooloff(tracker)
                     lines = ["🔴 AUTO-EXIT EXECUTED"]
                     if exited:
@@ -2304,7 +2901,7 @@ def main():
                     tracker.green_day_exited = True
                     log.info("Green day floor Rs %.0f breached — auto-exiting.", GREEN_DAY_FLOOR)
                     try:
-                        exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                        exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols | tracker.hedge_symbols))
                         lines = []
                         if exited:
                             lines.append(f"Exited: {', '.join(exited)}")
@@ -2327,7 +2924,7 @@ def main():
                 tracker.profit_target_hit = True
                 log.info("Profit target Rs %.0f hit — auto-exiting.", PROFIT_TARGET)
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols | tracker.hedge_symbols))
                     cooloff_until = _start_cooloff(tracker)
                     lines = []
                     if exited:
@@ -2373,7 +2970,7 @@ def main():
                 tracker.loss_limit_hit = True
                 log.info("Loss limit Rs %.0f hit — auto-exiting.", LOSS_LIMIT)
                 try:
-                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                    exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols | tracker.hedge_symbols))
                     cooloff_until = _start_cooloff(tracker)
                     lines = []
                     if exited:

@@ -219,6 +219,30 @@ clamped to `[ATR_MIN_MULTIPLIER, ATR_MAX_MULTIPLIER]`. If the India VIX quote fa
 
 The strangle's entry time (9:23 AM), entry cutoff (9:35 AM), and square-off time (3:00 PM) are **fixed in the code**, not configurable via `.env`.
 
+### Weekly NIFTY hedge
+
+Buys a far-OTM long CE+PE pair once a week (the first trading day on/after Wednesday),
+held without being touched daily, through that week's Tuesday expiry (cash-settles
+automatically — nothing to close). Completely separate from, and doesn't change, the
+daily strangle above — see the [Alert behavior](#6-alert-behavior) section for how the
+two interact.
+
+| Variable | Purpose | Default | Example |
+|---|---|---|---|
+| `HEDGE_ENABLED` | Master switch for the whole feature | `true` | `true` |
+| `HEDGE_STRIKE_OFFSET` | How far out-of-the-money to buy, in NIFTY strike points — much wider than the strangle's own offset | `1000` | `1000` |
+| `HEDGE_LOTS` | Number of lots per leg | `5` | `5` |
+| `HEDGE_ENTRY_BUFFER_PCT` | How aggressive the entry/exit limit order price is, as a % off the live price | `0.01` (1%) | `0.01` |
+| `HEDGE_ENTRY_RETRY_SECONDS` | Seconds between entry-order retry attempts if a leg hasn't filled | `20` | `20` |
+| `HEDGE_ENTRY_MAX_RETRIES` | How many times to retry an unfilled leg before giving up | `3` | `3` |
+| `HEDGE_STATE_FILE` | Where the current week's hedge progress is saved (so a restart doesn't lose track) | `hedge_state.json` | `hedge_state.json` |
+
+> ⚠️ `HEDGE_STRIKE_OFFSET`'s default (1000 points) is a reasoning-based starting guess at "far enough to be cheap," not tuned against real fills — actual premium depends on IV and time-to-expiry. Check `/hedge_status` after the first live entry and adjust via `/set hedge_strike_offset` if the premium paid isn't where you want it.
+
+The hedge's entry time (9:18 AM, 5 minutes before the strangle's own entry so the hedge
+is already in place when Kite prices that day's short-leg margin) and entry cutoff
+(9:30 AM) are **fixed in the code**, not configurable via `.env`.
+
 ### Greeks
 
 | Variable | Purpose | Default | Example |
@@ -234,7 +258,7 @@ The strangle's entry time (9:23 AM), entry cutoff (9:35 AM), and square-off time
 
 ### Pause/mute switches (not `.env` variables — see section 9)
 
-Four behaviors can be toggled by creating or deleting an empty file in the project directory, with no restart needed: `pause_auto_exit`, `pause_sl_orders`, `pause_strangle`, `mute_notifications`. These are normally controlled via Telegram commands (`/pause`, `/pause_sl`, `/pause_strangle`, `/stop`) rather than touched directly — see section 9.
+Five behaviors can be toggled by creating or deleting an empty file in the project directory, with no restart needed: `pause_auto_exit`, `pause_sl_orders`, `pause_strangle`, `pause_hedge`, `mute_notifications`. These are normally controlled via Telegram commands (`/pause`, `/pause_sl`, `/pause_strangle`, `/pause_hedge`, `/stop`) rather than touched directly — see section 9.
 
 ---
 
@@ -345,17 +369,25 @@ Cool-off: new positions auto-squared-off until 14:12:11
 - At **3:00 PM**, any strangle leg still open is squared off automatically.
 - The strangle's P&L, positions, and safety nets are **fully separate** from the manual-trading system above — a strangle leg is never counted in your manual P&L, never swept by the loss-limit/trailing-lock/profit-target exits, and vice versa.
 
+### Weekly hedge
+
+- On the first trading day **on or after Wednesday** each week (rolling forward automatically if Wednesday's an NSE holiday), if enabled and not already entered this week, the script resolves the nearest NIFTY expiry (naturally the coming Tuesday) and the strikes `HEDGE_STRIKE_OFFSET` points away from spot on each side, and **buys** one call and one put — 5 minutes before the strangle's own daily entry, so the hedge is already in place when Kite prices that day's short-leg margin.
+- Same retry/give-up discipline as the strangle: up to `HEDGE_ENTRY_MAX_RETRIES` retries with a widening limit price, no market-order fallback, no auto-correction of an asymmetric fill.
+- **No stop-loss and no scheduled exit** — it's a bought option, so the maximum loss is already capped at the premium paid. It's simply held until that week's Tuesday expiry and cash-settles automatically; the bot does nothing to it at expiry. Use `/close_hedge` if you ever want to exit it early.
+- Fully separate state from the strangle (`hedge_state.json`, not date-keyed — it deliberately survives every day's restart until the held expiry passes, unlike the strangle's state which resets every morning).
+- **Note on terminology**: this literal, bot-bought weekly hedge is a different thing from `HEDGE_PRICE_THRESHOLD` (any position priced below that threshold, historically meant for a hedge you bought yourself outside the bot). The weekly hedge is additionally excluded from every exit mechanism by *symbol*, not just by price — so it stays protected even if its premium later rises above `HEDGE_PRICE_THRESHOLD` during a sharp move (which the price-only mechanism alone would not have caught).
+
 ### Final safety-net (3:01–3:06 PM)
 
-A last-resort backstop, independent of everything above — covers **both** manual and strangle positions, unlike every other auto-exit mechanism in this system (which deliberately keep the two separate). The idea is to catch anything that should already be closed by 3 PM (a manual trailing/loss-limit exit, or the strangle's own 3:00 PM square-off) but somehow wasn't, rather than to be a normal part of the daily routine.
+A last-resort backstop, independent of everything above — covers **both** manual and strangle positions, unlike every other auto-exit mechanism in this system (which deliberately keep the two separate). The idea is to catch anything that should already be closed by 3 PM (a manual trailing/loss-limit exit, or the strangle's own 3:00 PM square-off) but somehow wasn't, rather than to be a normal part of the daily routine. The weekly hedge is excluded here too (by symbol) — this sweep must never touch it, or the whole point of holding it through the week would break.
 
 - From **3:01 PM**, if any non-hedge position (manual or strangle) is still open, an urgent warning repeats every 30 seconds telling you to close it.
 - At **3:06 PM**, everything non-hedge still open — manual or strangle — is squared off automatically, whether or not it should have been closed already.
-- This one **ignores `AUTO_EXIT` and the pause files** — it fires regardless, since its entire purpose is to be the backstop for when something else has already failed or been paused. If you deliberately want a position open past 3 PM, this will still close it.
+- This one **ignores `AUTO_EXIT` and the pause files** — it fires regardless, since its entire purpose is to be the backstop for when something else has already failed or been paused. If you deliberately want a position open past 3 PM, this will still close it (except the weekly hedge, which is never touched by this).
 
 ### Restart mid-day (a real scenario, not hypothetical)
 
-Systemd restarts the service automatically if it crashes. On every startup, before doing anything else, the script cross-checks its saved strangle state file against your *actual live* Zerodha positions and orders — it never blindly trusts what was last written to disk. If anything is ambiguous after a restart, it alerts you rather than guessing. Note, however, that a restart **does wipe all other in-memory tracking** (the trailing-lock peak/floor, which flags have already fired today, etc., for the manual-trading side) — those are not saved to disk and start over on the next check after restart.
+Systemd restarts the service automatically if it crashes. On every startup, before doing anything else, the script cross-checks its saved strangle state *and* hedge state against your *actual live* Zerodha positions and orders — it never blindly trusts what was last written to disk. This matters even more for the hedge than the strangle, since the hedge state must be correctly recognized across every one of the week's daily restarts, not just a same-day one. If anything is ambiguous after a restart, it alerts you rather than guessing. Note, however, that a restart **does wipe all other in-memory tracking** (the trailing-lock peak/floor, which flags have already fired today, etc., for the manual-trading side) — those are not saved to disk and start over on the next check after restart.
 
 ### Edge cases
 
@@ -380,8 +412,8 @@ Systemd restarts the service automatically if it crashes. On every startup, befo
 
 **Optional, as-needed:**
 - Send `/status` any time for a full snapshot.
-- Send `/strangle_status` to check today's strangle specifically.
-- Use `/pause`, `/pause_sl`, `/pause_strangle`, or `/stop` if you need to temporarily disable something without touching the server (see section 9).
+- Send `/strangle_status` to check today's strangle specifically, or `/hedge_status` for this week's hedge.
+- Use `/pause`, `/pause_sl`, `/pause_strangle`, `/pause_hedge`, or `/stop` if you need to temporarily disable something without touching the server (see section 9).
 
 ---
 
@@ -398,6 +430,7 @@ Systemd restarts the service automatically if it crashes. On every startup, befo
 | "Token exchange failed" while running `generate_token.py` | `KITE_API_SECRET` is wrong, or the `request_token` you pasted is more than ~60 seconds old | Re-run the login flow and paste the token immediately |
 | P&L always shows 0 | No open positions today (this is expected, not an error) | Open a position — the script re-checks periodically and will pick it up |
 | Strangle didn't enter today | `STRANGLE_ENABLED=false`, the `pause_strangle` file exists, `/skip_strangle` was sent, or both legs failed (check for an urgent Telegram alert) | Check `/strangle_status`; remove `pause_strangle` or send `/resume_strangle` if it was paused |
+| Hedge didn't enter this week | `HEDGE_ENABLED=false`, the `pause_hedge` file exists, `/skip_hedge` was sent, or both legs failed (check for an urgent Telegram alert) | Check `/hedge_status`; remove `pause_hedge` or send `/resume_hedge` if it was paused |
 | Notifications suddenly stopped | `/stop` was sent (or the `mute_notifications` file exists) | Send `/start` to resume |
 | SL orders no longer being placed for new positions | `/pause_sl` was sent (or `pause_sl_orders` file exists) | Send `/resume_sl` |
 
@@ -411,13 +444,13 @@ Send `/set` alone to list every live-tunable value with its current setting, or 
 
 **Safe to change in `.env`, but requires a `systemctl restart pnl-monitor` to take effect:** everything else listed in section 4's tables (e.g. `TRAIL_CHECK_INTERVAL`, `STRANGLE_STRIKE_OFFSET`, `NTFY_TOPIC`, `MILESTONE_STEP` as a starting default before your first `/set` override, etc.).
 
-**Safe to toggle without any restart, via Telegram commands** (these create/remove a small marker file in the project folder rather than changing `.env`): `/pause` ↔ `/resume` (auto-exit), `/pause_sl` ↔ `/resume_sl` (protective SL placement), `/pause_strangle` ↔ `/resume_strangle` (strangle auto-entry, future days only), `/stop` ↔ `/start` (all notifications).
+**Safe to toggle without any restart, via Telegram commands** (these create/remove a small marker file in the project folder rather than changing `.env`): `/pause` ↔ `/resume` (auto-exit), `/pause_sl` ↔ `/resume_sl` (protective SL placement), `/pause_strangle` ↔ `/resume_strangle` (strangle auto-entry, future days only), `/pause_hedge` ↔ `/resume_hedge` (hedge auto-entry, future weeks only), `/stop` ↔ `/start` (all notifications).
 
 **Do NOT touch without understanding the code first:**
 - The strangle's entry/cutoff/square-off **times** (9:23, 9:35, 3:00 PM) and the manual-trading market hours (9:15 AM–3:40 PM) are hardcoded, not `.env` settings — changing them means editing `with-websockets/pnl_monitor.py` directly.
 - The `TRAIL_TIERS` drawdown table and the ATR stop-loss multiplier (currently 2×) are also hardcoded — these came out of specific backtesting decisions (see the project's own memory notes) and shouldn't be casually adjusted without re-validating against real trade data.
 - `FREEZE_QTY_LIMIT` (1800) reflects NSE's own exchange-level order-size limit for F&O — this is a real exchange rule, not a tunable preference.
-- Never edit `strangle_state.json`, `.access_token`, or `pnl_history.json` by hand while the service is running — they're read and rewritten by the script itself and a manual edit mid-cycle risks state corruption.
+- Never edit `strangle_state.json`, `hedge_state.json`, `.access_token`, or `pnl_history.json` by hand while the service is running — they're read and rewritten by the script itself and a manual edit mid-cycle risks state corruption.
 
 ---
 
@@ -443,6 +476,7 @@ Other files:
 | `.env` | *(you create this)* — your real secrets and settings, never committed to git |
 | `.access_token` | *(created automatically)* — today's Zerodha access token |
 | `strangle_state.json` | *(created automatically)* — today's auto-strangle progress, survives restarts |
+| `hedge_state.json` | *(created automatically)* — the current week's hedge progress, survives every restart through the held expiry |
 | `pnl_history.json` | *(created automatically)* — daily end-of-day P&L history, read by `/history` |
 | `pnl_monitor.log` | *(created automatically)* — the script's own log file |
 | `check_positions.py`, `debug_pnl.py`, `exit_position.py`, `snapshot.py` | Small standalone developer/debugging utilities — not part of the live monitor's runtime, safe to ignore for normal operation |
