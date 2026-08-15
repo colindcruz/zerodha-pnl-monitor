@@ -18,7 +18,7 @@ import os
 import time
 import logging
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -115,6 +115,11 @@ PROFIT_TARGET           = float(os.getenv("PROFIT_TARGET", "80000"))   # exit al
 LOSS_WARNING_1          = float(os.getenv("LOSS_WARNING_1", "-20000"))  # warning alert
 LOSS_WARNING_2          = float(os.getenv("LOSS_WARNING_2", "-30000"))  # cut position size alert
 LOSS_LIMIT              = float(os.getenv("LOSS_LIMIT", "-40000"))      # hard shutdown — exit all
+
+# ---- Post-exit cool-off ----
+# After a loss-limit, profit-target, or trail-activation auto-exit, block manual trading
+# for this long: any new/added position gets auto-squared-off instead of protected with an SL.
+COOLOFF_MINUTES         = int(os.getenv("COOLOFF_MINUTES", "15"))
 
 # ---- Position size limit ----
 MAX_POSITION_QTY        = int(os.getenv("MAX_POSITION_QTY", "1950"))    # max qty per individual non-hedge position
@@ -990,6 +995,20 @@ def exit_non_hedge_positions(kite: KiteConnect, exclude_symbols: frozenset = fro
     return exited, skipped, failed
 
 
+def _start_cooloff(tracker: "PositionTracker") -> datetime:
+    """Arms the post-exit cool-off window; returns the IST timestamp it runs until."""
+    until = datetime.now(IST) + timedelta(minutes=COOLOFF_MINUTES)
+    with tracker.lock:
+        tracker.cooloff_until = until
+    return until
+
+
+def _cooloff_active(tracker: "PositionTracker") -> bool:
+    with tracker.lock:
+        until = tracker.cooloff_until
+    return until is not None and datetime.now(IST) < until
+
+
 # ---- Greeks ----
 
 def _get_option_meta(kite: KiteConnect, symbols: list[str]) -> dict[str, dict]:
@@ -1189,6 +1208,12 @@ class PositionTracker:
         self.green_day_armed = False    # True once P&L hits GREEN_DAY_ACTIVATION
         self.green_day_exited = False   # only fire once
 
+        # Post-exit cool-off: set to a future timestamp by the loss-limit/profit-target/
+        # trail-activation exit handlers; while now < cooloff_until, on_order_update and the
+        # REST safety-net poll auto-square-off any new/added position instead of protecting
+        # it with an SL. None means no cool-off is active.
+        self.cooloff_until: datetime | None = None
+
         # Position size limit state
         self.oversize_since = {}        # symbol -> timestamp when it first exceeded MAX_POSITION_QTY
         self.last_oversize_alert = 0.0  # timestamp of last oversize alert (60s cooldown)
@@ -1376,6 +1401,13 @@ def format_status(tracker: "PositionTracker", total_pnl: float, details: list, s
 
     lines.append(f"Profit target: Rs {PROFIT_TARGET:,.0f}" + (" — hit" if tracker.profit_target_hit else ""))
 
+    if tracker.cooloff_until and now_ist < tracker.cooloff_until:
+        remaining_min = int((tracker.cooloff_until - now_ist).total_seconds() // 60) + 1
+        lines.append(
+            f"Cool-off: ACTIVE until {tracker.cooloff_until.strftime('%H:%M:%S')} "
+            f"({remaining_min}m left) — new positions auto-squared-off"
+        )
+
     lines.append("")
     lines.append(f"Auto-exit: {'PAUSED' if PAUSE_FILE.exists() else 'enabled'}")
     lines.append(f"SL orders: {'PAUSED' if PAUSE_SL_FILE.exists() else 'enabled'}")
@@ -1562,6 +1594,7 @@ SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
     "exit_buffer_seconds": ("EXIT_BUFFER_SECONDS", int),
     "strangle_sl_multiplier": ("STRANGLE_SL_MULTIPLIER", float),
     "strangle_lots": ("STRANGLE_LOTS", int),
+    "cooloff_minutes": ("COOLOFF_MINUTES", int),
 }
 
 
@@ -1877,6 +1910,33 @@ def main():
                 threading.Thread(target=_cancel_open_orders, args=(kite, [symbol]), daemon=True).start()
                 return
 
+            # Cool-off enforcement — a fill that INCREASES exposure (fresh open or adding to an
+            # existing side) during the post-exit cool-off window gets squared off immediately
+            # instead of protected with an SL. A pure reduction is left alone (falls through to
+            # the normal SL-resize path below) since it's derisking, not a new order.
+            if _cooloff_active(tracker) and abs(new_qty) > abs(prev_qty):
+                log.warning("Cool-off violation: %s (qty %d during cool-off) — auto squaring off.", symbol, new_qty)
+
+                def _enforce_cooloff(sym=symbol):
+                    try:
+                        exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                        lines = []
+                        if exited:
+                            lines.append(f"Exited: {', '.join(exited)}")
+                        if failed:
+                            lines.append(f"FAILED: {', '.join(failed)}")
+                        notify(
+                            f"🚫 Cool-off violation — {sym}",
+                            "\n".join(lines) if lines else "No positions to exit.",
+                            priority="urgent",
+                        )
+                    except Exception as exc:
+                        log.error("Cool-off enforcement failed: %s", exc)
+                        notify("🚫 Cool-off enforcement ERROR", str(exc), priority="urgent")
+
+                threading.Thread(target=_enforce_cooloff, daemon=True).start()
+                return
+
             pos = {
                 "tradingsymbol": symbol,
                 "quantity": new_qty,
@@ -1921,13 +1981,34 @@ def main():
                     log.info("Position set changed — re-subscribed.")
                     # SL protection for newly opened non-hedge positions — this REST poll is a
                     # 2-min-lagging safety net; on_order_update below is the fast path that
-                    # normally already handles it (sl_placed_symbols dedupes the two).
+                    # normally already handles it (sl_placed_symbols dedupes the two). Same
+                    # lagging safety net applies to cool-off enforcement: on_order_update is the
+                    # fast path there too, this just catches anything it missed.
                     added_tokens = new_tokens - old_tokens
                     if added_tokens:
                         with tracker.lock:
                             new_pos = {t: tracker.positions[t] for t in added_tokens if t in tracker.positions}
-                        for token, pos in new_pos.items():
-                            _ensure_sl_order(kite, tracker, token, pos)
+                        if _cooloff_active(tracker) and new_pos:
+                            log.warning("Cool-off violation caught by REST safety net: %s — auto squaring off.",
+                                        ", ".join(p["tradingsymbol"] for p in new_pos.values()))
+                            try:
+                                exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                                lines = []
+                                if exited:
+                                    lines.append(f"Exited: {', '.join(exited)}")
+                                if failed:
+                                    lines.append(f"FAILED: {', '.join(failed)}")
+                                notify(
+                                    "🚫 Cool-off violation (REST safety net)",
+                                    "\n".join(lines) if lines else "No positions to exit.",
+                                    priority="urgent",
+                                )
+                            except Exception as exc:
+                                log.error("Cool-off enforcement failed: %s", exc)
+                                notify("🚫 Cool-off enforcement ERROR", str(exc), priority="urgent")
+                        else:
+                            for token, pos in new_pos.items():
+                                _ensure_sl_order(kite, tracker, token, pos)
                 last_position_refresh = now
 
             total_pnl, details = tracker.compute_pnl()
@@ -2053,6 +2134,7 @@ def main():
                 log.info("Auto-exit triggered after %ds breach.", EXIT_BUFFER_SECONDS)
                 try:
                     exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                    cooloff_until = _start_cooloff(tracker)
                     lines = ["🔴 AUTO-EXIT EXECUTED"]
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
@@ -2060,6 +2142,7 @@ def main():
                         lines.append(f"Kept (hedge): {', '.join(skipped)}")
                     if failed:
                         lines.append(f"FAILED: {', '.join(failed)}")
+                    lines.append(f"Cool-off: new positions auto-squared-off until {cooloff_until.strftime('%H:%M:%S')}")
                     notify("🔴 Auto-exit executed", "\n".join(lines[1:]), priority="urgent")
                 except Exception as exc:
                     log.error("Auto-exit failed: %s", exc)
@@ -2106,6 +2189,7 @@ def main():
                 log.info("Profit target Rs %.0f hit — auto-exiting.", PROFIT_TARGET)
                 try:
                     exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                    cooloff_until = _start_cooloff(tracker)
                     lines = []
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
@@ -2113,6 +2197,7 @@ def main():
                         lines.append(f"Kept (hedge): {', '.join(skipped)}")
                     if failed:
                         lines.append(f"FAILED: {', '.join(failed)}")
+                    lines.append(f"Cool-off: new positions auto-squared-off until {cooloff_until.strftime('%H:%M:%S')}")
                     notify(
                         f"🎯 Profit target Rs {PROFIT_TARGET:,.0f} hit — exited",
                         "\n".join(lines) if lines else "No positions to exit.",
@@ -2150,6 +2235,7 @@ def main():
                 log.info("Loss limit Rs %.0f hit — auto-exiting.", LOSS_LIMIT)
                 try:
                     exited, skipped, failed = exit_non_hedge_positions(kite, frozenset(tracker.strangle_symbols))
+                    cooloff_until = _start_cooloff(tracker)
                     lines = []
                     if exited:
                         lines.append(f"Exited: {', '.join(exited)}")
@@ -2157,6 +2243,7 @@ def main():
                         lines.append(f"Kept (hedge): {', '.join(skipped)}")
                     if failed:
                         lines.append(f"FAILED: {', '.join(failed)}")
+                    lines.append(f"Cool-off: new positions auto-squared-off until {cooloff_until.strftime('%H:%M:%S')}")
                     notify(
                         f"🛑 Loss limit Rs {LOSS_LIMIT:,.0f} hit — exited",
                         "\n".join(lines) if lines else "No positions to exit.",
