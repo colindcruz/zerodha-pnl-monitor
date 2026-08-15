@@ -36,8 +36,10 @@ print("\n=== VIX -> ATR multiplier ===\n")
 # At the reference VIX (15), multiplier should equal the base multiplier exactly.
 check("VIX=15 (reference) -> base multiplier", compute_vix_atr_multiplier(15) == ATR_BASE_MULTIPLIER)
 
-# Formula: 1.5 + (VIX - 15) * 0.1
-check("VIX=10 -> 1.0", compute_vix_atr_multiplier(10) == 1.0)
+# Formula: 1.5 + (VIX - 15) * 0.1, clamped to ATR_MIN_MULTIPLIER (1.5 as of 2026-08-15,
+# raised from the original 1.0 spec default — felt too tight at low VIX in practice).
+# Raw formula at VIX=10 is 1.0, below the current floor, so it clamps to the floor instead.
+check("VIX=10 -> clamps to ATR_MIN_MULTIPLIER", compute_vix_atr_multiplier(10) == ATR_MIN_MULTIPLIER)
 check("VIX=20 -> 2.0", compute_vix_atr_multiplier(20) == 2.0)
 check("VIX=25 -> 2.5", compute_vix_atr_multiplier(25) == 2.5)
 

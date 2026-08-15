@@ -297,7 +297,7 @@ ATR_INTERVAL = "5minute"
 ATR_BASE_MULTIPLIER  = float(os.getenv("ATR_BASE_MULTIPLIER", "1.5"))
 ATR_REFERENCE_VIX    = float(os.getenv("ATR_REFERENCE_VIX", "15"))
 ATR_VIX_SENSITIVITY  = float(os.getenv("ATR_VIX_SENSITIVITY", "0.1"))
-ATR_MIN_MULTIPLIER   = float(os.getenv("ATR_MIN_MULTIPLIER", "1.0"))
+ATR_MIN_MULTIPLIER   = float(os.getenv("ATR_MIN_MULTIPLIER", "1.5"))
 ATR_MAX_MULTIPLIER   = float(os.getenv("ATR_MAX_MULTIPLIER", "4.0"))
 INDIA_VIX_SYMBOL     = "NSE:INDIA VIX"
 

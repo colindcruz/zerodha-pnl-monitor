@@ -199,7 +199,7 @@ clamped to `[ATR_MIN_MULTIPLIER, ATR_MAX_MULTIPLIER]`. If the India VIX quote fa
 | `ATR_BASE_MULTIPLIER` | Multiplier when VIX equals the reference level | `1.5` | `1.5` |
 | `ATR_REFERENCE_VIX` | The VIX level the base multiplier is anchored to | `15` | `15` |
 | `ATR_VIX_SENSITIVITY` | How much the multiplier moves per 1-point VIX move away from the reference | `0.1` | `0.1` |
-| `ATR_MIN_MULTIPLIER` | Floor on the multiplier, however low VIX gets | `1.0` | `1.0` |
+| `ATR_MIN_MULTIPLIER` | Floor on the multiplier, however low VIX gets | `1.5` | `1.5` |
 | `ATR_MAX_MULTIPLIER` | Ceiling on the multiplier, however high VIX spikes | `4.0` | `4.0` |
 
 > ⚠️ These five defaults are a reasoning-based starting point, not backtested against real fills — validate against historical data before trusting this with meaningfully larger position size. `test_vix_atr.py` covers the pure formula/clamping logic offline; `test_atr_sl.py` is the live dry-run (no orders placed) that shows the actual VIX/multiplier/ATR numbers for your current positions.
