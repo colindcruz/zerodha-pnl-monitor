@@ -582,11 +582,18 @@ def enter_strangle(kite: KiteConnect, tracker: "PositionTracker") -> None:
                 save_strangle_state(state)
             notify(f"🚨 Strangle {leg_key} entry order FAILED", f"{leg['tradingsymbol']}: {exc}", priority="urgent")
 
-    notify(
-        "🦅 Strangle entry orders placed",
-        f"SOLD {state['legs']['CE']['tradingsymbol']} & {state['legs']['PE']['tradingsymbol']}\n"
-        f"Spot: Rs {legs['spot']:.2f} | Expiry: {legs['expiry']}\nAwaiting fill confirmation...",
-    )
+    # Only report legs whose order actually went in — a per-leg failure above (e.g.
+    # insufficient margin) must not be papered over by an unconditional "SOLD CE & PE".
+    placed = [k for k in ("CE", "PE") if state["legs"][k]["entry_status"] == "order_placed"]
+    if placed:
+        symbols_line = " & ".join(
+            f"{state['legs'][k]['tradingsymbol']} x{state['legs'][k]['qty']}" for k in placed
+        )
+        notify(
+            "🦅 Strangle entry orders placed",
+            f"SOLD {symbols_line}\n"
+            f"Spot: Rs {legs['spot']:.2f} | Expiry: {legs['expiry']}\nAwaiting fill confirmation...",
+        )
 
     # Retry loop: widen the limit buffer for any leg still unfilled, up to STRANGLE_ENTRY_MAX_RETRIES.
     for attempt in range(1, STRANGLE_ENTRY_MAX_RETRIES + 1):
@@ -670,7 +677,10 @@ def _on_strangle_leg_filled(kite: KiteConnect, tracker: "PositionTracker", data:
                 sl_order_ids = _place_strangle_sl_order(kite, leg, trigger)
                 leg["sl_order_id"] = sl_order_ids[0] if len(sl_order_ids) == 1 else sl_order_ids
                 leg["sl_trigger"] = trigger
-                notify(f"✅ Strangle {leg_key} filled", f"{symbol} SOLD @ Rs {avg_price:.2f} | SL trigger Rs {trigger:.2f}")
+                notify(
+                    f"✅ Strangle {leg_key} filled",
+                    f"{symbol} SOLD x{leg['qty']} @ Rs {avg_price:.2f} | SL trigger Rs {trigger:.2f}",
+                )
             except Exception as exc:
                 log.error("Strangle %s SL placement FAILED: %s", leg_key, exc)
                 notify(
