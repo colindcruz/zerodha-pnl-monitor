@@ -364,6 +364,7 @@ Cool-off: new positions auto-squared-off until 14:12:11
 
 ### Auto-strangle
 
+- At **9:21 AM** (2 minutes before entry), a heads-up alert fires if entry is actually going to be attempted today (same gating as the real entry below — you won't get a heads-up on a paused/holiday/already-done day).
 - Between **9:23 AM and 9:35 AM**, if enabled and not already attempted today, the script resolves the nearest NIFTY expiry and the strikes `STRANGLE_STRIKE_OFFSET` points away from spot on each side, and sells one call and one put.
 - **0DTE days** (the resolved expiry is today's date) write fewer lots — `STRANGLE_LOTS × STRANGLE_0DTE_LOT_FRACTION`, rounded down, floor of 1 — since margin required runs considerably higher that close to expiry. You get an alert when this kicks in. `STRANGLE_0DTE_LOT_FRACTION`'s default (0.5) is a rough starting estimate — check actual margin on the next few 0DTE days and tune it via `/set strangle_0dte_lot_fraction`.
 - If a leg's order doesn't fill, it's retried up to `STRANGLE_ENTRY_MAX_RETRIES` times (every `STRANGLE_ENTRY_RETRY_SECONDS`) with a progressively wider limit price. If the 9:35 AM cutoff passes with a leg still unfilled, the system **gives up** and sends an urgent alert — it does **not** fall back to a market order, and does **not** try to fix an imbalance if only one leg filled (e.g. from insufficient margin on the other). That's a deliberate design choice, not a bug — it means asymmetric or incomplete entries need a manual look via `/strangle_status`.
@@ -373,6 +374,7 @@ Cool-off: new positions auto-squared-off until 14:12:11
 
 ### Weekly hedge
 
+- At **9:16 AM** (2 minutes before entry), a heads-up alert fires if entry is actually going to be attempted this week (same gating as the real entry below).
 - On the first trading day **on or after Wednesday** each week (rolling forward automatically if Wednesday's an NSE holiday), if enabled and not already entered this week, the script resolves the nearest NIFTY expiry (naturally the coming Tuesday) and the strikes `HEDGE_STRIKE_OFFSET` points away from spot on each side, and **buys** one call and one put — 5 minutes before the strangle's own daily entry, so the hedge is already in place when Kite prices that day's short-leg margin.
 - Same retry/give-up discipline as the strangle: up to `HEDGE_ENTRY_MAX_RETRIES` retries with a widening limit price, no market-order fallback, no auto-correction of an asymmetric fill.
 - **No stop-loss and no scheduled exit** — it's a bought option, so the maximum loss is already capped at the premium paid. It's simply held until that week's Tuesday expiry and cash-settles automatically; the bot does nothing to it at expiry. Use `/close_hedge` if you ever want to exit it early.

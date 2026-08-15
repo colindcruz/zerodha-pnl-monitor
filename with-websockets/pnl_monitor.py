@@ -90,6 +90,7 @@ EXIT_BUFFER_SECONDS     = int(os.getenv("EXIT_BUFFER_SECONDS", "30"))  # wait th
 # ---- NIFTY short strangle (auto) ----
 STRANGLE_ENABLED             = os.getenv("STRANGLE_ENABLED", "true").lower() == "true"
 STRANGLE_ENTRY_TIME          = (9, 23)   # HH, MM IST — entry window opens
+STRANGLE_HEADSUP_TIME        = (9, 21)   # HH, MM IST — 2 min heads-up alert before entry
 STRANGLE_ENTRY_CUTOFF        = (9, 35)   # entry window closes; give up + alert if not done by then
 STRANGLE_EXIT_TIME           = (15, 0)   # HH, MM IST — square off any legs still open
 STRANGLE_STRIKE_OFFSET       = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))    # 1-strike-OTM on NIFTY's 50-pt strikes
@@ -127,6 +128,7 @@ STRANGLE_STATE_FILE = Path(os.getenv("STRANGLE_STATE_FILE", "strangle_state.json
 # VIX-ATR multiplier defaults elsewhere in this file.
 HEDGE_ENABLED         = os.getenv("HEDGE_ENABLED", "true").lower() == "true"
 HEDGE_ENTRY_TIME      = (9, 18)   # HH, MM IST — 5 min before STRANGLE_ENTRY_TIME
+HEDGE_HEADSUP_TIME    = (9, 16)   # HH, MM IST — 2 min heads-up alert before entry
 HEDGE_ENTRY_CUTOFF    = (9, 30)   # entry window closes; give up + alert if not done by then
 HEDGE_STRIKE_OFFSET   = int(os.getenv("HEDGE_STRIKE_OFFSET", "1000"))  # far-OTM, NIFTY 50-pt strikes
 HEDGE_LOTS            = int(os.getenv("HEDGE_LOTS", "5"))
@@ -2647,6 +2649,8 @@ def main():
     eod_summary_sent = False
     last_final_warning_alert = 0.0
     final_squareoff_done = False
+    hedge_headsup_sent = False
+    strangle_headsup_sent = False
 
     try:
         while True:
@@ -2706,6 +2710,22 @@ def main():
             now_ist = datetime.now(IST)
             hedge_entry_start = now_ist.replace(hour=HEDGE_ENTRY_TIME[0], minute=HEDGE_ENTRY_TIME[1], second=0, microsecond=0)
             hedge_entry_cutoff = now_ist.replace(hour=HEDGE_ENTRY_CUTOFF[0], minute=HEDGE_ENTRY_CUTOFF[1], second=0, microsecond=0)
+            hedge_headsup_time = now_ist.replace(hour=HEDGE_HEADSUP_TIME[0], minute=HEDGE_HEADSUP_TIME[1], second=0, microsecond=0)
+
+            # Same gating as the real entry check below, so the heads-up only fires on a day
+            # entry will actually be attempted (not on a paused/holiday/already-done day).
+            if (not hedge_headsup_sent
+                    and hedge_entries_enabled()
+                    and not is_nse_holiday(now_ist.date())
+                    and now_ist.weekday() >= 2
+                    and hedge_headsup_time <= now_ist < hedge_entry_start
+                    and not tracker.hedge_state.get("entry_attempted")
+                    and not tracker.hedge_state.get("skip_week")):
+                hedge_headsup_sent = True
+                notify(
+                    "⏰ Hedge entry in ~2 min",
+                    f"Buying this week's far-OTM hedge at {HEDGE_ENTRY_TIME[0]}:{HEDGE_ENTRY_TIME[1]:02d} IST.",
+                )
 
             if (hedge_entries_enabled()
                     and not is_nse_holiday(now_ist.date())
@@ -2721,6 +2741,19 @@ def main():
             strangle_entry_start = now_ist.replace(hour=STRANGLE_ENTRY_TIME[0], minute=STRANGLE_ENTRY_TIME[1], second=0, microsecond=0)
             strangle_entry_cutoff = now_ist.replace(hour=STRANGLE_ENTRY_CUTOFF[0], minute=STRANGLE_ENTRY_CUTOFF[1], second=0, microsecond=0)
             strangle_exit_time = now_ist.replace(hour=STRANGLE_EXIT_TIME[0], minute=STRANGLE_EXIT_TIME[1], second=0, microsecond=0)
+            strangle_headsup_time = now_ist.replace(hour=STRANGLE_HEADSUP_TIME[0], minute=STRANGLE_HEADSUP_TIME[1], second=0, microsecond=0)
+
+            if (not strangle_headsup_sent
+                    and strangle_entries_enabled()
+                    and not is_nse_holiday(now_ist.date())
+                    and strangle_headsup_time <= now_ist < strangle_entry_start
+                    and not tracker.strangle_state.get("entry_attempted")
+                    and not tracker.strangle_state.get("skip_today")):
+                strangle_headsup_sent = True
+                notify(
+                    "⏰ Strangle entry in ~2 min",
+                    f"Selling today's 1-OTM CE+PE at {STRANGLE_ENTRY_TIME[0]}:{STRANGLE_ENTRY_TIME[1]:02d} IST.",
+                )
 
             if (strangle_entries_enabled()
                     and not is_nse_holiday(now_ist.date())
