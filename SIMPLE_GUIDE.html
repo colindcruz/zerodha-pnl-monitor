@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>P&amp;L Monitor — Plain-English Guide</title>
+<style>
+  @page { size: A4; margin: 20mm 18mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", Calibri, Arial, sans-serif;
+    font-size: 10.5pt;
+    line-height: 1.5;
+    color: #1a1a1a;
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 20pt;
+    color: #0b3d91;
+    border-bottom: 3px solid #0b3d91;
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+  }
+  .subtitle {
+    color: #555;
+    font-size: 10pt;
+    margin-top: 0;
+    margin-bottom: 24px;
+    font-style: italic;
+  }
+  h2 {
+    font-size: 14pt;
+    color: #0b3d91;
+    background: #eef3fc;
+    padding: 6px 10px;
+    border-left: 5px solid #0b3d91;
+    margin-top: 30px;
+    margin-bottom: 12px;
+    page-break-after: avoid;
+  }
+  h3 {
+    font-size: 11.5pt;
+    color: #14356b;
+    margin-top: 18px;
+    margin-bottom: 6px;
+    page-break-after: avoid;
+  }
+  p { margin: 8px 0; }
+  strong { color: #0b3d91; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0 18px 0;
+    font-size: 9.3pt;
+    page-break-inside: auto;
+  }
+  th {
+    background: #0b3d91;
+    color: #fff;
+    text-align: left;
+    padding: 7px 8px;
+    font-weight: 600;
+  }
+  td {
+    padding: 7px 8px;
+    border-bottom: 1px solid #dde3ee;
+    vertical-align: top;
+  }
+  tr:nth-child(even) td { background: #f6f8fc; }
+  ul, ol { margin: 6px 0 14px 0; padding-left: 22px; }
+  li { margin-bottom: 7px; }
+  .msg {
+    background: #eef7ee;
+    border: 1px solid #b8dcb8;
+    border-left: 4px solid #3a9c3a;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 8px 0 4px 0;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 9pt;
+    white-space: pre-wrap;
+    page-break-inside: avoid;
+  }
+  .msg.warn { background: #fff8ea; border-color: #e8cf8a; border-left-color: #c9982f; }
+  .msg.bad  { background: #fdecec; border-color: #f0b7b7; border-left-color: #c0392b; }
+  .msg-label {
+    font-family: "Segoe UI", Calibri, Arial, sans-serif;
+    font-weight: 600;
+    font-size: 9.5pt;
+    color: #444;
+    margin: 14px 0 4px 0;
+  }
+  .msg-note {
+    font-size: 8.7pt;
+    color: #666;
+    font-style: italic;
+    margin: 0 0 14px 0;
+  }
+  .note {
+    background: #fff8ea;
+    border: 1px solid #e8cf8a;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 10px 0 18px 0;
+    font-size: 9.5pt;
+  }
+  .important {
+    background: #eef3fc;
+    border: 1px solid #b7c9ec;
+    border-left: 4px solid #0b3d91;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 12px 0 18px 0;
+    font-size: 9.8pt;
+  }
+  .small { font-size: 9pt; color: #666; font-style: italic; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-family: "Consolas", monospace; font-size: 9pt; }
+  hr { border: none; border-top: 1px solid #dde3ee; margin: 26px 0; }
+</style>
+</head>
+<body>
+
+<h1>Your P&amp;L Monitor — Plain-English Guide</h1>
+<p class="subtitle">Quick-reference for day-to-day use. For setup or technical detail, see MANUAL.md instead — this one skips all of that.</p>
+
+<h2>1. What it does</h2>
+<p>It watches your Zerodha account continuously, about once a second, and sends you a Telegram message whenever something worth knowing happens — a profit or loss milestone, a stop-loss getting placed, or a threshold being crossed. On top of watching, it also runs two things automatically on your behalf: it sells a small NIFTY options trade every trading day around <strong>9:23am</strong> and closes it by <strong>3pm</strong>, and once a week it buys a cheap "insurance" option that reduces how much margin (money set aside by your broker) the daily trade needs. If your <strong>manual</strong> trading loses or gains more than the limits you've set, it will automatically close those positions for you rather than wait for you to act. Everything else you trade yourself — it just protects those trades with automatic stop-losses and watches your overall P&amp;L.</p>
+
+<div class="important"><strong>Important:</strong> the daily NIFTY trade and the weekly hedge run in a completely separate bucket. The ₹ thresholds in section 2 below only look at your manual trading — the automated trade's own profit/loss never counts toward them, and none of the automatic closes described below ever touch the automated trade or its hedge. It's protected by its own, separate stop-loss instead (see the "Daily NIFTY trade" row).</div>
+
+<h2>2. Current default settings</h2>
+<table>
+<tr><th style="width:22%">Setting</th><th style="width:18%">Currently set to</th><th>What it means in practice</th></tr>
+<tr><td>First loss warning</td><td>₹20,000 down (manual only)</td><td>You get a warning message. Nothing is closed automatically.</td></tr>
+<tr><td>Second loss warning</td><td>₹30,000 down (manual only)</td><td>A stronger warning, suggesting you cut position size in half. Still nothing closed automatically.</td></tr>
+<tr><td>Hard loss stop</td><td>₹40,000 down (manual only)</td><td>All your manual/other positions get closed automatically, right away. The automated NIFTY trade and its hedge are a separate bucket and are <strong>never</strong> touched by this.</td></tr>
+<tr><td>Profit target</td><td>₹80,000 up (manual only)</td><td>All your manual/other positions get closed automatically to lock in the win. The automated NIFTY trade and its hedge are <strong>never</strong> touched by this.</td></tr>
+<tr><td>Profit check-in step</td><td>Every ₹5,000</td><td>An update every time your <strong>manual-trading</strong> running total crosses another ₹5,000, either direction, until the trailing lock takes over.</td></tr>
+<tr><td>Trailing lock starts</td><td>Manual trading ₹40,000 up</td><td>From here it tracks your highest profit point of the day and protects a chunk of it — see section 3.</td></tr>
+<tr><td>Early "green day" floor</td><td>Arms at ₹20,000 up, floor at ₹5,000 (manual only)</td><td>A gentler, earlier net that only applies before the trailing lock has kicked in. Falls back to ₹5,000 &rarr; your manual positions close — the automated trade is untouched.</td></tr>
+<tr><td>Cool-off after a forced exit</td><td>15 minutes</td><td>After any automatic close above, a new <strong>manual</strong> position opened within 15 minutes gets auto-closed again too.</td></tr>
+<tr><td>What counts as a "hedge" among your manual trades</td><td>Priced under ₹5</td><td>Among your own manual positions, cheap ones are assumed to be insurance, not real bets — never touched by any auto-close rule above. (The automated trade's weekly hedge is separate again.)</td></tr>
+<tr><td>Big-position alert</td><td>1,950 units (~30 lots)</td><td>A warning if any single position gets this large. Nothing closes automatically — just a heads-up.</td></tr>
+<tr><td>"Still alive" check-in</td><td>Every 60 minutes</td><td>Even on a totally quiet day, a message confirms the monitor is still running.</td></tr>
+<tr><td>Daily NIFTY trade</td><td>On, 5 lots/day (2 on expiry day)</td><td>Sells a near-the-money call and put automatically each morning ~9:23am, protected by its own stop-loss, closed by 3pm.</td></tr>
+<tr><td>Weekly protective hedge</td><td>On, 5 lots/week</td><td>Buys a cheap far-out option once a week (Wednesday) that lowers the margin needed for the daily trade. Held all week.</td></tr>
+</table>
+<p class="small">There are also a handful of behind-the-scenes technical knobs — retry timing, order buffer percentages, file locations — that don't change what you see or how much is at risk day-to-day, so they're left out of this table on purpose.</p>
+
+<h2>3. What happens if you change a setting</h2>
+<ul>
+<li><strong>Loss warnings / hard loss stop</strong> — Lower the ₹ amount and it reacts sooner (safer, but a wobble stops you out more easily). Raise it and you give yourself more room to be wrong before your manual positions are forced closed. Measured on manual trading only — no effect on the automated NIFTY trade.</li>
+<li><strong>Profit target</strong> — Lower it and you lock in wins earlier but leave more on the table on a good day. Raise it and winners run longer, at the risk of giving more back. Same scope note — manual trading only.</li>
+<li><strong>Trailing lock start point</strong> — The point where "every ₹5,000" updates stop and active peak-profit protection begins. Lower it and protection kicks in sooner on a smaller win; raise it and you need a bigger win first.</li>
+<li><strong>Green day floor</strong> — Only matters early in the day, before the trailing lock has armed. Raising the floor protects more of an early gain; lowering it gives a small early profit more room before anything closes.</li>
+<li><strong>Cool-off minutes</strong> — Longer means more of a forced timeout after a big stop-loss or target hit before you can trade freely again. Shorter gets you back to normal sooner.</li>
+<li><strong>What counts as a hedge (₹5 threshold)</strong> — Raise it and more cheap positions get ignored by the safety nets. Lower it and fewer positions get that pass — only genuinely near-worthless ones.</li>
+<li><strong>Daily NIFTY trade lots</strong> — More lots means more premium collected on a good day, and a proportionally bigger loss on a bad one. Not a small tweak — it directly scales your risk every single trading day.</li>
+<li><strong>Weekly hedge lots/distance</strong> — More lots on the hedge costs more upfront but caps risk further out; moving it closer to your daily trade's strikes is cheaper margin but a tighter (and pricier) hedge. Not yet fine-tuned against real numbers — treat as experimental.</li>
+</ul>
+
+<h2>4. What messages you'll actually receive</h2>
+
+<div class="msg-label">Normal day, nothing unusual</div>
+<div class="msg">⏰ Strangle entry in ~2 min
+Selling today's 1-OTM CE+PE at 9:23 IST.</div>
+<div class="msg">🦅 Strangle entry orders placed
+SOLD NIFTY2582624650CE x325 &amp; NIFTY2582624550PE x325
+Spot: Rs 24,612.30 | Expiry: 2026-08-26
+Awaiting fill confirmation...</div>
+<div class="msg">💓 Heartbeat
+Monitor alive. Positions: 2 | P&amp;L: Rs 1,240.50</div>
+<div class="msg">📅 EOD SUMMARY — 2026-08-15
+Final P&amp;L: Rs 3,180.00
+Peak: Rs 4,050.00  |  Trough: Rs -620.00
+Gave back Rs 870.00 from the day's peak</div>
+
+<div class="msg-label">Loss threshold hit</div>
+<div class="msg warn">⚠️ Loss warning — Rs 20k down
+P&amp;L is Rs -21,340.00. Stay cautious.</div>
+<div class="msg bad">🛑 Loss limit Rs -40,000 hit — exited
+Exited: BANKNIFTY2582651000PE
+Cool-off: new positions auto-squared-off until 11:47:03</div>
+<p class="msg-note">(This only ever lists your own manual positions — never the automated NIFTY trade or its hedge, which aren't included in this ₹ total at all.)</p>
+
+<div class="msg-label">Profit threshold hit</div>
+<div class="msg">🎯 Profit target Rs 80,000 hit — exited
+Exited: BANKNIFTY2582651000PE
+Cool-off: new positions auto-squared-off until 13:02:15</div>
+
+<div class="msg-label">Something going wrong</div>
+<div class="msg bad">🔑 Access token error
+Incorrect `api_key` or `access_token`.
+Run generate_token.py and restart the service.</div>
+
+<div class="note"><strong>Worth knowing:</strong> that token-error message only fires if the connection to your broker fails right when the monitor starts up. If the connection drops mid-day instead, it does <strong>not</strong> proactively message you — it just quietly keeps showing the last numbers it had until the connection comes back. In practice this is rare, since the token refreshes automatically every weekday morning.</div>
+
+<h2>5. What you need to do each day</h2>
+<p><strong>Nothing, normally.</strong> The daily login/token refresh happens automatically every weekday morning before the market opens, and you'll get a Telegram message either way:</p>
+<ul>
+<li>✅ a success message once it's refreshed and the monitor's restarted, or</li>
+<li>❌ a failure message if it didn't work — the one case where you'd need to step in and sort out the login yourself.</li>
+</ul>
+<p>Everything else — the daily trade, the weekly hedge, the stop-losses, the safety nets — runs on its own. Your only <em>optional</em> daily habit is glancing at Telegram in the morning to confirm you got the ✅, and checking in occasionally during the day if you want a live read.</p>
+
+<h2>6. Quick answers to obvious questions</h2>
+
+<h3>Does it place trades for me, or just tell me?</h3>
+<p>Both, depending on what you mean. The daily NIFTY trade and the weekly hedge are fully automatic — it decides the strikes, places the orders, and manages the stop-loss without you doing anything, and these run completely separately from everything below. For everything <em>else</em> you trade yourself, it never opens a new position on its own — it only protects what you've already opened (automatic stop-loss, and closing those manual positions if one of the ₹ thresholds is hit).</p>
+
+<h3>What happens if the morning login step fails — does it just stop silently, or tell me?</h3>
+<p>It tells you. You'll get a Telegram message saying the automatic login failed, and at that point you'd need to log in manually yourself before the monitor can do anything that day.</p>
+
+<h3>Does it keep alerting me every few minutes once a threshold is hit, or just once?</h3>
+<p>Depends which one. The hard stops (loss limit, profit target, green-day floor) each fire once and take action immediately. The trailing-lock breach is the one exception — if your peak profit gives back too much, it repeats an urgent "still below the floor" alert every 15 seconds until it either recovers or auto-closes, so it can't be missed.</p>
+
+<h3>What happens over the weekend or on a market holiday?</h3>
+<p>Nothing trades. No new positions get opened, and you won't get milestone or heartbeat messages either — the monitor just sits quietly until the next real trading day. It knows about specific NSE holidays as well as weekends, so it won't try to trade on those either.</p>
+
+<h3>Can I temporarily switch things off without asking for help touching the server?</h3>
+<p>Yes — send <code>/pause</code> (stops auto-closing), <code>/pause_sl</code> (stops new stop-losses), <code>/pause_strangle</code> or <code>/pause_hedge</code> (stops tomorrow's/next week's automatic trade), or <code>/stop</code> (mutes all messages). Each has a matching <code>/resume_*</code> or <code>/start</code> to switch it back on. Send <code>/help</code> any time for the full list, or <code>/status</code> for a live snapshot right now.</p>
+
+</body>
+</html>
