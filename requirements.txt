@@ -1,5 +1,6 @@
 kiteconnect>=5.0.1
 python-dotenv>=1.0.0
 requests>=2.31.0
-# Optional: for automated TOTP-based login in generate_token.py
-# pyotp>=2.9.0
+# Required by auto_token.py's unattended daily login (hard `import pyotp`, no fallback).
+# Also used for generate_token.py's optional automated-login path.
+pyotp>=2.9.0

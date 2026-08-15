@@ -143,6 +143,32 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN  = (9, 15)
 MARKET_CLOSE = (15, 40)
 
+# NSE Equity/Derivatives-segment trading holidays. Verified against two independent
+# sources (cleartax.in, groww.in) cross-checked against each other on 2026-08-15 —
+# not fetched from NSE's own site, so re-verify before relying on it for a new year.
+# Needs a manual update every year; nothing here fetches this automatically.
+# Excludes the special Sunday 2026-11-08 Muhurat Trading session (Diwali Laxmi Pujan) —
+# that's an extra half-hour evening session, not a normal trading day, and isn't
+# relevant to this bot's 9:23am strangle entry / 3pm exit window.
+NSE_HOLIDAYS = {
+    "2026-01-15",  # Maharashtra municipal elections
+    "2026-01-26",  # Republic Day
+    "2026-03-03",  # Holi
+    "2026-03-26",  # Shri Ram Navami
+    "2026-03-31",  # Shri Mahavir Jayanti
+    "2026-04-03",  # Good Friday
+    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2026-05-01",  # Maharashtra Day
+    "2026-05-28",  # Bakri Id
+    "2026-06-26",  # Muharram
+    "2026-09-14",  # Ganesh Chaturthi
+    "2026-10-02",  # Mahatma Gandhi Jayanti
+    "2026-10-20",  # Dussehra
+    "2026-11-10",  # Diwali - Balipratipada
+    "2026-11-24",  # Prakash Gurpurb Sri Guru Nanak Dev
+    "2026-12-25",  # Christmas
+}
+
 # ============================================================
 
 def _read_access_token() -> str:
@@ -156,9 +182,13 @@ def _read_access_token() -> str:
     return token
 
 
+def is_nse_holiday(d: date) -> bool:
+    return d.isoformat() in NSE_HOLIDAYS
+
+
 def is_market_open() -> bool:
     now = datetime.now(IST)
-    if now.weekday() >= 5:
+    if now.weekday() >= 5 or is_nse_holiday(now.date()):
         return False
     t = (now.hour, now.minute)
     return MARKET_OPEN <= t <= MARKET_CLOSE
@@ -2032,6 +2062,7 @@ def main():
             strangle_exit_time = now_ist.replace(hour=STRANGLE_EXIT_TIME[0], minute=STRANGLE_EXIT_TIME[1], second=0, microsecond=0)
 
             if (strangle_entries_enabled()
+                    and not is_nse_holiday(now_ist.date())
                     and strangle_entry_start <= now_ist < strangle_entry_cutoff
                     and not tracker.strangle_state.get("entry_attempted")
                     and not tracker.strangle_state.get("skip_today")):

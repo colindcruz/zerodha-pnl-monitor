@@ -13,7 +13,8 @@ It will:
 
 Optional automation:
     pip install pyotp
-    Set KITE_TOTP_SECRET in .env to skip the manual TOTP step.
+    Set ZERODHA_USER_ID, ZERODHA_PASSWORD, and ZERODHA_TOTP_SECRET in .env to skip
+    the manual login/TOTP steps (same variable names auto_token.py uses).
 """
 
 import os
@@ -37,13 +38,13 @@ REDIRECT_URL = os.getenv("KITE_REDIRECT_URL", "https://127.0.0.1")
 
 def _try_automated_login() -> str | None:
     """
-    If KITE_TOTP_SECRET is set and pyotp is installed, perform a headless
+    If ZERODHA_TOTP_SECRET is set and pyotp is installed, perform a headless
     login and return the request_token without any manual steps.
     Returns None if automation is not configured.
     """
-    totp_secret = os.getenv("KITE_TOTP_SECRET", "")
-    user_id = os.getenv("KITE_USER_ID", "")
-    password = os.getenv("KITE_PASSWORD", "")
+    totp_secret = os.getenv("ZERODHA_TOTP_SECRET", "")
+    user_id = os.getenv("ZERODHA_USER_ID", "")
+    password = os.getenv("ZERODHA_PASSWORD", "")
 
     if not (totp_secret and user_id and password):
         return None
