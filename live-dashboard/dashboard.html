@@ -14,6 +14,7 @@
     --ce:           #2a78d6;
     --pe:           #eb6834;
     --combined:     #159a68;
+    --spot:         #7c5cbf;
     --good:         #1a8a4a;
     --bad:          #c23b2e;
     --warn:         #b8860b;
@@ -33,6 +34,7 @@
       --ce:           #3987e5;
       --pe:           #d95926;
       --combined:     #199e70;
+      --spot:         #a68ce0;
       --good:         #3fbd7a;
       --bad:          #e35b4d;
       --warn:         #d6a53a;
@@ -52,6 +54,7 @@
     --ce:           #3987e5;
     --pe:           #d95926;
     --combined:     #199e70;
+    --spot:         #a68ce0;
     --good:         #3fbd7a;
     --bad:          #e35b4d;
     --warn:         #d6a53a;
@@ -157,12 +160,14 @@
   .toggle .swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; opacity: .35; transition: opacity .12s; }
   .toggle.on { color: var(--text-primary); border-color: var(--tone); background: color-mix(in srgb, var(--tone) 10%, var(--surface-2)); }
   .toggle.on .swatch { opacity: 1; }
+  .toggle.dashed .swatch { background-image: repeating-linear-gradient(90deg, currentColor 0 3px, transparent 3px 5px); }
   .toggle:focus-visible { outline: 2px solid var(--tone); outline-offset: 2px; }
 
   svg { display: block; width: 100%; height: auto; overflow: visible; }
   .gridline { stroke: var(--border-soft); stroke-width: 1; }
   .axis-label { fill: var(--text-muted); font-size: 10.5px; }
   .series-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .series-line.dashed { stroke-dasharray: 5 4; }
   .crosshair-line { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0; }
   .tooltip {
     position: absolute; pointer-events: none;
@@ -239,6 +244,10 @@
       <div class="stat-label"><span class="stat-dot" style="background:var(--combined)"></span>Combined last</div>
       <div class="stat-value" id="stat-combined">—</div>
     </div>
+    <div class="stat-chip">
+      <div class="stat-label"><span class="stat-dot" style="background:var(--spot)"></span>NIFTY spot</div>
+      <div class="stat-value" id="stat-spot">—</div>
+    </div>
   </div>
 
   <div class="panel">
@@ -252,13 +261,25 @@
     </div>
   </div>
 
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">NIFTY spot</div>
+    </div>
+    <div class="chart-holder">
+      <svg id="spot-chart" viewBox="0 0 900 200" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="tooltip" id="spot-tooltip"></div>
+    </div>
+  </div>
+
   <div class="footnote">
     <strong>Reading this:</strong> live CE/PE option prices, not a P&amp;L or trading
     dashboard — that logic lives in the trading bot itself. Candle boundaries are
     clock-aligned to 09:15 IST regardless of your timezone. Strike dropdowns default to
     7-strikes-OTM (350 pts) each side and re-follow the At-The-Money strike automatically
     unless you pick one yourself, in which case your pick sticks until you change it or
-    reload. "Combined" is CE + PE added together.
+    reload. "Combined" is CE + PE added together. NIFTY spot is shown on its own chart
+    with its own scale — it moves in ~24,000-point territory, options in ~10-150, so a
+    shared axis would flatten one of them to a flat line.
   </div>
 
 </div>
@@ -322,34 +343,79 @@
   if (![1, 2, 3, 5].includes(timeframeMinutes)) timeframeMinutes = 5;
 
   const legs = {
-    CE: { token: null, symbol: "", otm: null, manualOverride: false, oneMin: new Map(), lastPrice: null },
-    PE: { token: null, symbol: "", otm: null, manualOverride: false, oneMin: new Map(), lastPrice: null },
+    CE: { token: null, symbol: "", otm: null, manualOverride: false, oneMin: new Map(), lastPrice: null, lastCumVolume: null },
+    PE: { token: null, symbol: "", otm: null, manualOverride: false, oneMin: new Map(), lastPrice: null, lastCumVolume: null },
   };
-  const seriesState = { ce: true, pe: true, combined: true };
+  // NIFTY 50 index — its own small chart with its own scale (see the fallback-day
+  // resolution below: it reuses the same activeDate as CE/PE rather than probing
+  // independently, since it always trades on the same days).
+  const spot = { token: null, oneMin: new Map(), lastPrice: null };
+  const seriesState = { ce: true, ceVwap: false, pe: true, peVwap: false, combined: true, combinedVwap: false };
 
   // ---------------------------------------------------------------
   // Candle bucketing (1-min base candles, merged client-side into the
   // active timeframe — backfilled once from /api/historical at "minute"
   // granularity, updated live thereafter from ticks)
   // ---------------------------------------------------------------
-  function onTick(side, realMs, price) {
+  function onTick(side, realMs, price, cumVolume) {
     const leg = legs[side];
+    // Kite ticks carry cumulative day volume, not a per-tick delta — derive the
+    // volume traded within this bucket by diffing against the last reading. The
+    // first tick after a strike switch just establishes the baseline (no prior
+    // reading to diff against yet).
+    let deltaVol = 0;
+    if (cumVolume != null) {
+      if (leg.lastCumVolume != null) deltaVol = Math.max(0, cumVolume - leg.lastCumVolume);
+      leg.lastCumVolume = cumVolume;
+    }
     const bKey = bucketStartRealMs(realMs, 1);
     let c = leg.oneMin.get(bKey);
     if (!c) {
-      c = { o: price, h: price, l: price, c: price };
+      c = { o: price, h: price, l: price, c: price, v: deltaVol };
       leg.oneMin.set(bKey, c);
     } else {
       c.c = price;
       if (price > c.h) c.h = price;
       if (price < c.l) c.l = price;
+      c.v = (c.v || 0) + deltaVol;
     }
     leg.lastPrice = price;
   }
 
-  function mergeTimeframe(oneMin, minutes) {
+  function onSpotTick(realMs, price) {
+    const bKey = bucketStartRealMs(realMs, 1);
+    let c = spot.oneMin.get(bKey);
+    if (!c) {
+      spot.oneMin.set(bKey, { o: price, h: price, l: price, c: price });
+    } else {
+      c.c = price;
+      if (price > c.h) c.h = price;
+      if (price < c.l) c.l = price;
+    }
+    spot.lastPrice = price;
+  }
+
+  // Cumulative VWAP at 1-min granularity: vwap_t = Σ(close_i · volume_i) / Σ(volume_i)
+  // from session start through t. Computed at the finest granularity available and
+  // then sampled at whatever display timeframe is active — resumming volume *within*
+  // each larger bucket would compute a different (wrong) number, VWAP is inherently a
+  // running total from day start, not a per-bucket statistic.
+  function vwapSeries(oneMin) {
+    const sorted = [...oneMin.entries()].sort((a, b) => a[0] - b[0]);
+    let cumPV = 0, cumV = 0;
+    const out = [];
+    for (const [t, c] of sorted) {
+      const vol = c.v || 0;
+      cumPV += c.c * vol;
+      cumV += vol;
+      out.push([t, cumV > 0 ? cumPV / cumV : c.c]);
+    }
+    return new Map(out);
+  }
+
+  function mergeTimeframe(oneMin, minutes, vwapByMinute) {
     if (minutes === 1) {
-      return [...oneMin.entries()].sort((a, b) => a[0] - b[0]).map(([t, c]) => ({ t, ...c }));
+      return [...oneMin.entries()].sort((a, b) => a[0] - b[0]).map(([t, c]) => ({ t, ...c, vwap: vwapByMinute.get(t) }));
     }
     const groups = new Map();
     for (const [t, c] of oneMin.entries()) {
@@ -364,7 +430,8 @@
         g.l = Math.min(g.l, c.l);
       }
     }
-    return [...groups.values()].sort((a, b) => a.t - b.t).map(({ t, o, h, l, c }) => ({ t, o, h, l, c }));
+    return [...groups.values()].sort((a, b) => a.t - b.t)
+      .map(({ t, o, h, l, c, _lastT }) => ({ t, o, h, l, c, vwap: vwapByMinute.get(_lastT) }));
   }
 
   function combinedSeries(ceArr, peArr) {
@@ -383,6 +450,24 @@
     return out;
   }
 
+  // Matches the static dashboard's convention: combined VWAP is simply CE VWAP + PE
+  // VWAP added together (not a re-derived VWAP of the combined premium's own volume).
+  function combinedVwapSeries(ceArr, peArr) {
+    const keys = new Set([...ceArr.map((d) => d.t), ...peArr.map((d) => d.t)]);
+    const sorted = [...keys].sort((a, b) => a - b);
+    const ceByT = new Map(ceArr.map((d) => [d.t, d.vwap]));
+    const peByT = new Map(peArr.map((d) => [d.t, d.vwap]));
+    let lastCe = null, lastPe = null;
+    const out = [];
+    for (const t of sorted) {
+      if (ceByT.has(t) && ceByT.get(t) != null) lastCe = ceByT.get(t);
+      if (peByT.has(t) && peByT.get(t) != null) lastPe = peByT.get(t);
+      if (lastCe == null || lastPe == null) continue;
+      out.push({ t, c: lastCe + lastPe });
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------
   // Backfill + strike resolution
   // ---------------------------------------------------------------
@@ -390,6 +475,59 @@
     const res = await fetch(`/api/strikes?type=${type}`);
     if (!res.ok) throw new Error(`strikes fetch failed: ${res.status}`);
     return res.json();
+  }
+
+  // Which calendar date (IST, "YYYY-MM-DD") the chart is currently showing. Normally
+  // today, but on a non-trading day (weekend/holiday) or before today's first candle
+  // exists, falls back to the most recent day that actually has data — shared across
+  // both legs so CE and PE never end up looking at different days.
+  let activeDate = null;
+  let activeDatePromise = null;
+
+  function isWithinTodaySession(now = Date.now()) {
+    return now >= sessionStartRealMs(now) && now <= sessionEndRealMs(now);
+  }
+
+  async function probeHasData(token, dateStr) {
+    try {
+      const res = await fetch(`/api/historical?token=${token}&interval=minute&from=${encodeURIComponent(dateStr + " 09:15:00")}&to=${encodeURIComponent(dateStr + " 15:30:00")}`);
+      if (!res.ok) return false;
+      const data = await res.json();
+      return (data.candles || []).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async function resolveActiveDate(token) {
+    if (activeDate) return activeDate;
+    if (activeDatePromise) return activeDatePromise;
+    activeDatePromise = (async () => {
+      const now = Date.now();
+      const today = todayISTDateStr(now);
+      // Always check today's own data first, rather than trusting a clock/weekday
+      // heuristic (which can't tell a weekday holiday from a normal trading day, and
+      // would otherwise misfire — e.g. treating a Saturday afternoon as "today has a
+      // live session" purely because the clock happens to read 09:15-15:40).
+      if (await probeHasData(token, today)) return today;
+      // No data for today (weekend, holiday, or just very early pre-market) — walk
+      // backward, skipping weekends, until a day with real data turns up. If it's
+      // actually just pre-market on a real trading day, the periodic ATM-poll rolls
+      // this forward to today again once the first live candle appears.
+      let probeMs = now - 24 * 3600000;
+      for (let i = 0; i < 10; i++) {
+        const dow = new Date(istVirtualMs(probeMs)).getUTCDay(); // 0=Sun, 6=Sat
+        const dateStr = todayISTDateStr(probeMs);
+        if (dow !== 0 && dow !== 6 && (await probeHasData(token, dateStr))) {
+          return dateStr;
+        }
+        probeMs -= 24 * 3600000;
+      }
+      return todayISTDateStr(now); // give up — show today (will just be empty)
+    })();
+    activeDate = await activeDatePromise;
+    activeDatePromise = null;
+    return activeDate;
   }
 
   function populateDropdown(side, data) {
@@ -410,18 +548,65 @@
   async function backfill(side) {
     const leg = legs[side];
     if (!leg.token) return;
-    const from = `${todayISTDateStr()} 09:15:00`;
-    const to = nowISTDateTimeStr();
+    const date = await resolveActiveDate(leg.token);
+    const isToday = date === todayISTDateStr();
+    const from = `${date} 09:15:00`;
+    const to = isToday ? nowISTDateTimeStr() : `${date} 15:30:00`;
     try {
       const res = await fetch(`/api/historical?token=${leg.token}&interval=minute&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
       if (!res.ok) return;
       const data = await res.json();
-      (data.candles || []).forEach((c) => {
+      const candles = data.candles || [];
+      candles.forEach((c) => {
         const t = bucketStartRealMs(Date.parse(c.date), 1);
-        leg.oneMin.set(t, { o: c.open, h: c.high, l: c.low, c: c.close });
+        leg.oneMin.set(t, { o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume || 0 });
       });
+      // Seed the "last price" stat from backfill too — on a non-trading fallback day
+      // no ticks will ever arrive to set it otherwise.
+      if (candles.length && leg.lastPrice == null) {
+        leg.lastPrice = candles[candles.length - 1].close;
+      }
     } catch (e) {
       console.error("backfill failed", side, e);
+    }
+  }
+
+  async function backfillSpot() {
+    if (!spot.token) return;
+    // Reuses whatever date CE/PE already resolved (same trading calendar) rather than
+    // probing again — resolveActiveDate's in-flight-promise guard makes this safe even
+    // if it races with the CE/PE legs' own first backfill call.
+    const date = await resolveActiveDate(spot.token);
+    const isToday = date === todayISTDateStr();
+    const from = `${date} 09:15:00`;
+    const to = isToday ? nowISTDateTimeStr() : `${date} 15:30:00`;
+    try {
+      const res = await fetch(`/api/historical?token=${spot.token}&interval=minute&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const candles = data.candles || [];
+      candles.forEach((c) => {
+        const t = bucketStartRealMs(Date.parse(c.date), 1);
+        spot.oneMin.set(t, { o: c.open, h: c.high, l: c.low, c: c.close });
+      });
+      if (candles.length && spot.lastPrice == null) {
+        spot.lastPrice = candles[candles.length - 1].close;
+      }
+    } catch (e) {
+      console.error("spot backfill failed", e);
+    }
+  }
+
+  async function initSpot() {
+    try {
+      const res = await fetch("/api/spot-info");
+      if (!res.ok) throw new Error(`spot-info fetch failed: ${res.status}`);
+      const data = await res.json();
+      spot.token = data.instrument_token;
+      wsSend({ type: "subscribe", tokens: [spot.token] });
+      await backfillSpot();
+    } catch (e) {
+      console.error("spot init failed", e);
     }
   }
 
@@ -434,6 +619,7 @@
     leg.otm = info.otm;
     leg.oneMin = new Map();
     leg.lastPrice = null;
+    leg.lastCumVolume = null;
     wsSend({ type: "subscribe", tokens: [leg.token] });
     await backfill(side);
     scheduleRender();
@@ -467,7 +653,23 @@
   });
 
   // Poll for ATM drift; only auto-follow sides that haven't been manually overridden.
+  // Also: if we're showing a fallback day (no trading today when the session
+  // started) and today's own session has since opened, roll forward to live data.
   setInterval(async () => {
+    if (activeDate && activeDate !== todayISTDateStr() && isWithinTodaySession()) {
+      activeDate = null;
+      activeDatePromise = null;
+      for (const side of ["CE", "PE"]) {
+        legs[side].oneMin = new Map();
+        legs[side].lastPrice = null;
+        legs[side].lastCumVolume = null;
+        await backfill(side);
+      }
+      spot.oneMin = new Map();
+      spot.lastPrice = null;
+      await backfillSpot();
+      scheduleRender();
+    }
     for (const side of ["CE", "PE"]) {
       try {
         const data = await fetchStrikes(side);
@@ -507,14 +709,17 @@
   // Series toggles
   // ---------------------------------------------------------------
   const SERIES = [
-    { key: "ce", tone: "ce", label: "CE price" },
-    { key: "pe", tone: "pe", label: "PE price" },
-    { key: "combined", tone: "combined", label: "Combined price" },
+    { key: "ce", tone: "ce", label: "CE price", dashed: false },
+    { key: "ceVwap", tone: "ce", label: "CE VWAP", dashed: true },
+    { key: "pe", tone: "pe", label: "PE price", dashed: false },
+    { key: "peVwap", tone: "pe", label: "PE VWAP", dashed: true },
+    { key: "combined", tone: "combined", label: "Combined price", dashed: false },
+    { key: "combinedVwap", tone: "combined", label: "Combined VWAP", dashed: true },
   ];
   const togglesEl = document.getElementById("toggles");
   SERIES.forEach((s) => {
     const label = document.createElement("label");
-    label.className = "toggle" + (seriesState[s.key] ? " on" : "");
+    label.className = "toggle" + (seriesState[s.key] ? " on" : "") + (s.dashed ? " dashed" : "");
     label.style.setProperty("--tone", `var(--${s.tone})`);
     label.innerHTML = `<input type="checkbox" ${seriesState[s.key] ? "checked" : ""}><span class="swatch" style="background:var(--${s.tone})"></span>${s.label}`;
     label.querySelector("input").addEventListener("change", (e) => {
@@ -526,30 +731,19 @@
   });
 
   // ---------------------------------------------------------------
-  // Chart
+  // Chart — a single reusable drawing routine, since the options chart (multi-series,
+  // toggleable, VWAP overlays) and the NIFTY spot chart (one series, no toggles) are
+  // otherwise identical: gridlines, x-axis, line+dot, crosshair, hover tooltip.
   // ---------------------------------------------------------------
-  const svg = document.getElementById("chart");
-  const tooltip = document.getElementById("tooltip");
-  const W = 900, H = 340, PAD_L = 52, PAD_R = 16, PAD_T = 14, PAD_B = 28;
-  const plotW = W - PAD_L - PAD_R, plotH = H - PAD_T - PAD_B;
+  const chartSvg = document.getElementById("chart");
+  const chartTooltip = document.getElementById("tooltip");
+  const spotSvg = document.getElementById("spot-chart");
+  const spotTooltip = document.getElementById("spot-tooltip");
 
-  function currentSeriesData() {
-    const ceArr = mergeTimeframe(legs.CE.oneMin, timeframeMinutes);
-    const peArr = mergeTimeframe(legs.PE.oneMin, timeframeMinutes);
-    const combArr = combinedSeries(ceArr, peArr);
-    return { ce: ceArr, pe: peArr, combined: combArr };
-  }
-
-  let lastTimes = [];
-  let lastActive = [];
-
-  function render() {
+  function drawChart(svg, tooltip, W, H, active) {
+    const PAD_L = 52, PAD_R = 16, PAD_T = 14, PAD_B = 28;
+    const plotW = W - PAD_L - PAD_R, plotH = H - PAD_T - PAD_B;
     svg.innerHTML = "";
-    const data = currentSeriesData();
-    const active = [];
-    if (seriesState.ce && data.ce.length) active.push({ key: "ce", tone: "ce", label: "CE price", arr: data.ce });
-    if (seriesState.pe && data.pe.length) active.push({ key: "pe", tone: "pe", label: "PE price", arr: data.pe });
-    if (seriesState.combined && data.combined.length) active.push({ key: "combined", tone: "combined", label: "Combined price", arr: data.combined });
 
     if (!active.length) {
       const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
@@ -557,7 +751,6 @@
       t.setAttribute("text-anchor", "middle"); t.setAttribute("class", "axis-label");
       t.textContent = "Waiting for data…";
       svg.appendChild(t);
-      lastTimes = []; lastActive = [];
       return;
     }
 
@@ -565,7 +758,6 @@
     active.forEach((s) => s.arr.forEach((d) => allT.add(d.t)));
     const times = [...allT].sort((a, b) => a - b);
     const n = times.length;
-    lastTimes = times; lastActive = active;
     if (n < 2) {
       const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
       t.setAttribute("x", W / 2); t.setAttribute("y", H / 2);
@@ -620,7 +812,7 @@
       const d = pts.map(([i, v], idx) => `${idx === 0 ? "M" : "L"}${xAt(i).toFixed(2)},${yAt(v).toFixed(2)}`).join(" ");
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
       path.setAttribute("d", d);
-      path.setAttribute("class", "series-line");
+      path.setAttribute("class", "series-line" + (s.dashed ? " dashed" : ""));
       path.setAttribute("stroke", `var(--${s.tone})`);
       svg.appendChild(path);
 
@@ -633,37 +825,35 @@
 
     const crossLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
     crossLine.setAttribute("y1", PAD_T); crossLine.setAttribute("y2", H - PAD_B);
-    crossLine.setAttribute("class", "crosshair-line"); crossLine.setAttribute("id", "crosshair");
+    crossLine.setAttribute("class", "crosshair-line");
     svg.appendChild(crossLine);
 
     const hitRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     hitRect.setAttribute("x", PAD_L); hitRect.setAttribute("y", PAD_T);
     hitRect.setAttribute("width", plotW); hitRect.setAttribute("height", plotH);
     hitRect.setAttribute("fill", "transparent");
-    hitRect.addEventListener("mousemove", (e) => onHover(e, active));
+    hitRect.addEventListener("mousemove", onHover);
     hitRect.addEventListener("mouseleave", () => {
-      const c = document.getElementById("crosshair");
-      if (c) c.style.opacity = 0;
+      crossLine.style.opacity = 0;
       tooltip.style.opacity = 0;
     });
     svg.appendChild(hitRect);
 
-    function onHover(e, activeSeries) {
+    function onHover(e) {
       const rect = svg.getBoundingClientRect();
       const scaleX = W / rect.width;
       const mx = (e.clientX - rect.left) * scaleX;
       let i = Math.round(((mx - PAD_L) / plotW) * (n - 1));
       i = Math.max(0, Math.min(n - 1, i));
 
-      const cross = document.getElementById("crosshair");
-      cross.setAttribute("x1", xAt(i)); cross.setAttribute("x2", xAt(i));
-      cross.style.opacity = 1;
+      crossLine.setAttribute("x1", xAt(i)); crossLine.setAttribute("x2", xAt(i));
+      crossLine.style.opacity = 1;
 
       const holderRect = svg.parentElement.getBoundingClientRect();
       const px = (xAt(i) / W) * holderRect.width;
 
       let html = `<div class="tooltip-time">${fmtHM(times[i])}</div>`;
-      activeSeries.forEach((s) => {
+      active.forEach((s) => {
         const byT = new Map(s.arr.map((d) => [d.t, d.c]));
         let v = null;
         for (let j = i; j >= 0; j--) { if (byT.has(times[j])) { v = byT.get(times[j]); break; } }
@@ -678,6 +868,36 @@
     }
   }
 
+  function currentSeriesData() {
+    const ceVwapByMin = vwapSeries(legs.CE.oneMin);
+    const peVwapByMin = vwapSeries(legs.PE.oneMin);
+    const ceArr = mergeTimeframe(legs.CE.oneMin, timeframeMinutes, ceVwapByMin);
+    const peArr = mergeTimeframe(legs.PE.oneMin, timeframeMinutes, peVwapByMin);
+    const combArr = combinedSeries(ceArr, peArr);
+    const ceVwapArr = ceArr.filter((d) => d.vwap != null).map((d) => ({ t: d.t, c: d.vwap }));
+    const peVwapArr = peArr.filter((d) => d.vwap != null).map((d) => ({ t: d.t, c: d.vwap }));
+    const combinedVwapArr = combinedVwapSeries(ceArr, peArr);
+    return { ce: ceArr, pe: peArr, combined: combArr, ceVwap: ceVwapArr, peVwap: peVwapArr, combinedVwap: combinedVwapArr };
+  }
+
+  function render() {
+    const data = currentSeriesData();
+    const active = [];
+    if (seriesState.ce && data.ce.length) active.push({ key: "ce", tone: "ce", label: "CE price", arr: data.ce, dashed: false });
+    if (seriesState.ceVwap && data.ceVwap.length) active.push({ key: "ceVwap", tone: "ce", label: "CE VWAP", arr: data.ceVwap, dashed: true });
+    if (seriesState.pe && data.pe.length) active.push({ key: "pe", tone: "pe", label: "PE price", arr: data.pe, dashed: false });
+    if (seriesState.peVwap && data.peVwap.length) active.push({ key: "peVwap", tone: "pe", label: "PE VWAP", arr: data.peVwap, dashed: true });
+    if (seriesState.combined && data.combined.length) active.push({ key: "combined", tone: "combined", label: "Combined price", arr: data.combined, dashed: false });
+    if (seriesState.combinedVwap && data.combinedVwap.length) active.push({ key: "combinedVwap", tone: "combined", label: "Combined VWAP", arr: data.combinedVwap, dashed: true });
+    drawChart(chartSvg, chartTooltip, 900, 340, active);
+  }
+
+  function renderSpotChart() {
+    const spotArr = mergeTimeframe(spot.oneMin, timeframeMinutes, new Map());
+    const active = spotArr.length ? [{ key: "spot", tone: "spot", label: "NIFTY spot", arr: spotArr, dashed: false }] : [];
+    drawChart(spotSvg, spotTooltip, 900, 200, active);
+  }
+
   let renderScheduled = false;
   function scheduleRender() {
     if (renderScheduled) return;
@@ -685,6 +905,7 @@
     setTimeout(() => {
       renderScheduled = false;
       render();
+      renderSpotChart();
       updateStats();
     }, 300);
   }
@@ -694,6 +915,7 @@
     document.getElementById("stat-pe").textContent = fmtRs(legs.PE.lastPrice);
     document.getElementById("stat-combined").textContent =
       legs.CE.lastPrice != null && legs.PE.lastPrice != null ? fmtRs(legs.CE.lastPrice + legs.PE.lastPrice) : "—";
+    document.getElementById("stat-spot").textContent = fmtRs(spot.lastPrice);
   }
 
   // ---------------------------------------------------------------
@@ -724,17 +946,21 @@
     ws.onopen = () => {
       reconnectAttempt = 0;
       setConnStatus("live");
-      const tokens = [legs.CE.token, legs.PE.token].filter(Boolean);
+      const tokens = [legs.CE.token, legs.PE.token, spot.token].filter(Boolean);
       if (tokens.length) wsSend({ type: "subscribe", tokens });
     };
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type !== "tick") return;
-      const side = msg.instrument_token === legs.CE.token ? "CE" : msg.instrument_token === legs.PE.token ? "PE" : null;
-      if (!side || msg.last_price == null) return;
+      if (msg.type !== "tick" || msg.last_price == null) return;
       const realMs = msg.timestamp ? Date.parse(msg.timestamp) : Date.now();
-      onTick(side, realMs, msg.last_price);
+      if (msg.instrument_token === spot.token) {
+        onSpotTick(realMs, msg.last_price);
+      } else {
+        const side = msg.instrument_token === legs.CE.token ? "CE" : msg.instrument_token === legs.PE.token ? "PE" : null;
+        if (!side) return;
+        onTick(side, realMs, msg.last_price, msg.volume_traded);
+      }
       scheduleRender();
     };
     ws.onclose = () => {
@@ -756,7 +982,10 @@
   function updateBanner() {
     const now = Date.now();
     const banner = document.getElementById("market-banner");
-    if (now < sessionStartRealMs(now)) {
+    if (activeDate && activeDate !== todayISTDateStr(now)) {
+      banner.style.display = "block";
+      banner.textContent = `No trading today — showing the last trading day's data (${activeDate}).`;
+    } else if (now < sessionStartRealMs(now)) {
       banner.style.display = "block";
       banner.textContent = "Market not open yet — opens 09:15 IST.";
     } else if (now > sessionEndRealMs(now)) {
@@ -773,8 +1002,9 @@
   // Boot
   // ---------------------------------------------------------------
   connectWS();
-  Promise.all([initLegDefaults("CE"), initLegDefaults("PE")]).then(() => {
+  Promise.all([initLegDefaults("CE"), initLegDefaults("PE"), initSpot()]).then(() => {
     render();
+    renderSpotChart();
     updateStats();
   });
 })();

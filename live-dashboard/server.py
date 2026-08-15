@@ -30,7 +30,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiohttp import web, WSMsgType
+from aiohttp import WSCloseCode, WSMsgType, web
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect, KiteTicker
 
@@ -217,6 +217,23 @@ async def handle_strikes(request: web.Request) -> web.Response:
     return web.json_response({"atm": atm, "spot": spot, "expiry": expiry.isoformat(), "strikes": strikes})
 
 
+_spot_token_cache: dict = {"instrument_token": None}
+
+
+async def handle_spot_info(request: web.Request) -> web.Response:
+    """Resolves the NIFTY 50 index's instrument_token, needed to subscribe/backfill it
+    like any other instrument — indices aren't in the NFO options dump this server
+    already caches, so this comes from kite.ltp()'s response instead (which conveniently
+    includes instrument_token alongside last_price), resolved once and cached."""
+    if _spot_token_cache["instrument_token"] is None:
+        try:
+            data = kite.ltp([INDEX_SPOT_SYMBOL])
+            _spot_token_cache["instrument_token"] = data[INDEX_SPOT_SYMBOL]["instrument_token"]
+        except Exception as exc:
+            return web.json_response({"error": f"could not resolve spot instrument: {exc}"}, status=502)
+    return web.json_response({"instrument_token": _spot_token_cache["instrument_token"], "symbol": "NIFTY 50"})
+
+
 async def handle_historical(request: web.Request) -> web.Response:
     token = request.query.get("token")
     interval = request.query.get("interval", "minute")
@@ -301,6 +318,10 @@ def on_ticks(ws, ticks):
             "type": "tick",
             "instrument_token": token,
             "last_price": tick.get("last_price"),
+            # Cumulative day volume (MODE_FULL field) — the client derives per-candle
+            # volume by diffing consecutive readings, since Kite ticks carry a running
+            # total rather than a per-tick delta. Used for the VWAP overlay.
+            "volume_traded": tick.get("volume_traded"),
             "timestamp": ltt.isoformat() if hasattr(ltt, "isoformat") else datetime.now(IST).isoformat(),
         })
         with clients_lock:
@@ -389,6 +410,21 @@ async def on_startup(app: web.Application) -> None:
     kws.connect(threaded=True)
 
 
+async def on_shutdown(app: web.Application) -> None:
+    """Proactively close every open browser WebSocket connection. Without this,
+    aiohttp's own graceful-shutdown sequence has to wait for each /ws handler's
+    `async for msg in ws` loop to exit on its own — which only happens when the
+    client disconnects — so a single browser tab left open turns a SIGTERM into a
+    multi-second (observed: ~30s+) hang instead of an immediate clean exit."""
+    with clients_lock:
+        clients = list(ws_clients.keys())
+    for ws in clients:
+        try:
+            await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutting down")
+        except Exception:
+            pass
+
+
 def build_app() -> web.Application:
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/login", get_login)
@@ -396,9 +432,11 @@ def build_app() -> web.Application:
     app.router.add_get("/logout", get_logout)
     app.router.add_get("/", get_dashboard)
     app.router.add_get("/api/strikes", handle_strikes)
+    app.router.add_get("/api/spot-info", handle_spot_info)
     app.router.add_get("/api/historical", handle_historical)
     app.router.add_get("/ws", handle_ws)
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     return app
 
 
