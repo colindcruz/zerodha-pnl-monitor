@@ -185,6 +185,25 @@ The trailing-lock drawdown itself (how far P&L can fall from its peak before tri
 | `COOLOFF_MINUTES` | After a loss-limit, profit-target, or trailing-lock auto-exit, block new manual trades for this many minutes (see section 6) | `15` | `15` |
 | `MAX_POSITION_QTY` | Alert (not auto-exit) if any single non-hedge position's quantity exceeds this | `1950` | `1950` |
 
+### VIX-adaptive ATR stop-loss (manual trades only)
+
+Protects every open **manual** position (never the strangle, which has its own separate premium-multiple SL). On every fill, an SL-LIMIT order is (re)placed at `multiplier × 14-period 5-min ATR` from the entry/pyramid-anchor price — the multiplier itself scales with India VIX instead of being fixed:
+
+```
+multiplier = ATR_BASE_MULTIPLIER + (current India VIX - ATR_REFERENCE_VIX) * ATR_VIX_SENSITIVITY
+```
+clamped to `[ATR_MIN_MULTIPLIER, ATR_MAX_MULTIPLIER]`. If the India VIX quote fails to fetch, it falls back to `ATR_BASE_MULTIPLIER` rather than skipping SL placement.
+
+| Variable | Purpose | Default | Example |
+|---|---|---|---|
+| `ATR_BASE_MULTIPLIER` | Multiplier when VIX equals the reference level | `1.5` | `1.5` |
+| `ATR_REFERENCE_VIX` | The VIX level the base multiplier is anchored to | `15` | `15` |
+| `ATR_VIX_SENSITIVITY` | How much the multiplier moves per 1-point VIX move away from the reference | `0.1` | `0.1` |
+| `ATR_MIN_MULTIPLIER` | Floor on the multiplier, however low VIX gets | `1.0` | `1.0` |
+| `ATR_MAX_MULTIPLIER` | Ceiling on the multiplier, however high VIX spikes | `4.0` | `4.0` |
+
+> ⚠️ These five defaults are a reasoning-based starting point, not backtested against real fills — validate against historical data before trusting this with meaningfully larger position size. `test_vix_atr.py` covers the pure formula/clamping logic offline; `test_atr_sl.py` is the live dry-run (no orders placed) that shows the actual VIX/multiplier/ATR numbers for your current positions.
+
 ### NIFTY auto-strangle
 
 | Variable | Purpose | Default | Example |

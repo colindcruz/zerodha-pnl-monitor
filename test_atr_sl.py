@@ -23,6 +23,15 @@ HEDGE_PRICE_THRESHOLD = float(os.getenv("HEDGE_PRICE_THRESHOLD", "5.0"))
 ATR_PERIOD = 14
 IST = ZoneInfo("Asia/Kolkata")
 
+# VIX-adaptive multiplier — mirrors compute_vix_atr_multiplier in with-websockets/pnl_monitor.py.
+# Reasoning-based starting point, not backtested — see that module's comment for the caveat.
+ATR_BASE_MULTIPLIER = float(os.getenv("ATR_BASE_MULTIPLIER", "1.5"))
+ATR_REFERENCE_VIX   = float(os.getenv("ATR_REFERENCE_VIX", "15"))
+ATR_VIX_SENSITIVITY = float(os.getenv("ATR_VIX_SENSITIVITY", "0.1"))
+ATR_MIN_MULTIPLIER  = float(os.getenv("ATR_MIN_MULTIPLIER", "1.0"))
+ATR_MAX_MULTIPLIER  = float(os.getenv("ATR_MAX_MULTIPLIER", "4.0"))
+INDIA_VIX_SYMBOL    = "NSE:INDIA VIX"
+
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(TOKEN)
 
@@ -68,10 +77,23 @@ def fetch_atr(instrument_token, symbol):
         return None
 
 
-def calc_sl(pos, atr):
+def compute_vix_atr_multiplier(current_vix):
+    multiplier = ATR_BASE_MULTIPLIER + (current_vix - ATR_REFERENCE_VIX) * ATR_VIX_SENSITIVITY
+    return max(ATR_MIN_MULTIPLIER, min(ATR_MAX_MULTIPLIER, multiplier))
+
+
+def fetch_india_vix():
+    try:
+        return kite.ltp([INDIA_VIX_SYMBOL])[INDIA_VIX_SYMBOL]["last_price"]
+    except Exception as exc:
+        print(f"  India VIX fetch failed: {exc}")
+        return None
+
+
+def calc_sl(pos, atr, multiplier):
     qty = pos["quantity"]
     avg = pos["average_price"]
-    sl_dist = 2 * atr
+    sl_dist = multiplier * atr
     if qty > 0:
         trigger     = round(avg - sl_dist, 1)
         buffer      = min(10.0, max(1.0, round(trigger * 0.01, 1)))
@@ -125,13 +147,17 @@ for pos in positions_to_test:
     atr = fetch_atr(token, symbol)
     if atr:
         print(f"  ATR (14-period, 5-min): Rs {atr}")
-        tx, trigger, limit_price = calc_sl(pos, atr)
+        current_vix = fetch_india_vix()
+        multiplier = compute_vix_atr_multiplier(current_vix) if current_vix is not None else ATR_BASE_MULTIPLIER
+        vix_str = f"{current_vix:.2f}" if current_vix is not None else "unavailable (using base multiplier)"
+        print(f"  India VIX: {vix_str} -> multiplier {multiplier:.2f}x")
+        tx, trigger, limit_price = calc_sl(pos, atr, multiplier)
         print(f"  SL: {tx} at trigger Rs {trigger}, limit Rs {limit_price}")
         print(f"  (DRY RUN — no order placed)")
         notify(
             f"📐 [TEST] New position: {symbol}",
             f"{direction} {qty} qty | avg Rs {avg}\n"
-            f"5-min ATR (14): Rs {atr}\n"
+            f"5-min ATR (14): Rs {atr} | VIX: {vix_str} | multiplier: {multiplier:.2f}x\n"
             f"SL order would be placed: trigger Rs {trigger} | limit Rs {limit_price}\n"
             f"(DRY RUN — no order placed)",
         )

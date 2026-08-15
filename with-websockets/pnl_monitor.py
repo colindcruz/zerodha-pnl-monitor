@@ -287,6 +287,34 @@ FREEZE_QTY_LIMIT = 1800  # NSE exchange freeze quantity per order for F&O
 ATR_PERIOD = 14
 ATR_INTERVAL = "5minute"
 
+# ---- VIX-adaptive ATR multiplier (manual-trade SL only — the strangle has its own,
+# separate premium-multiple SL and is never touched by this) ----
+# multiplier = ATR_BASE_MULTIPLIER + (current_VIX - ATR_REFERENCE_VIX) * ATR_VIX_SENSITIVITY,
+# clamped to [ATR_MIN_MULTIPLIER, ATR_MAX_MULTIPLIER]. Wider stops when VIX is elevated,
+# tighter when calm, instead of the old fixed 2x. NOTE: these defaults are a
+# reasoning-based starting point, not backtested against real fills — validate against
+# historical data before trusting this with meaningfully larger size.
+ATR_BASE_MULTIPLIER  = float(os.getenv("ATR_BASE_MULTIPLIER", "1.5"))
+ATR_REFERENCE_VIX    = float(os.getenv("ATR_REFERENCE_VIX", "15"))
+ATR_VIX_SENSITIVITY  = float(os.getenv("ATR_VIX_SENSITIVITY", "0.1"))
+ATR_MIN_MULTIPLIER   = float(os.getenv("ATR_MIN_MULTIPLIER", "1.0"))
+ATR_MAX_MULTIPLIER   = float(os.getenv("ATR_MAX_MULTIPLIER", "4.0"))
+INDIA_VIX_SYMBOL     = "NSE:INDIA VIX"
+
+
+def compute_vix_atr_multiplier(current_vix: float) -> float:
+    """Pure function — see the module comment above for the formula and its caveat."""
+    multiplier = ATR_BASE_MULTIPLIER + (current_vix - ATR_REFERENCE_VIX) * ATR_VIX_SENSITIVITY
+    return max(ATR_MIN_MULTIPLIER, min(ATR_MAX_MULTIPLIER, multiplier))
+
+
+def _fetch_india_vix(kite: KiteConnect) -> float | None:
+    try:
+        return kite.ltp([INDIA_VIX_SYMBOL])[INDIA_VIX_SYMBOL]["last_price"]
+    except Exception as exc:
+        log.warning("Could not fetch India VIX: %s", exc)
+        return None
+
 
 def _fetch_atr(kite: KiteConnect, instrument_token: int, symbol: str) -> float | None:
     """Fetch 5-min historical data and compute 14-period ATR for a symbol."""
@@ -312,18 +340,19 @@ def _fetch_atr(kite: KiteConnect, instrument_token: int, symbol: str) -> float |
         log.warning("ATR fetch failed for %s: %s", symbol, exc)
         return None
 
-def _place_sl_order(kite: KiteConnect, pos: dict, atr: float) -> tuple[float, float, list]:
+def _place_sl_order(kite: KiteConnect, pos: dict, atr: float, multiplier: float) -> tuple[float, float, list]:
     """
-    Place SL-Limit order at 2x ATR from the stop anchor (Turtle-style: the most recent
-    entry price when pyramiding into a winner, not the blended average cost — so the stop
-    ratchets toward each new add instead of loosening back to the average). Falls back to
-    average_price if the caller doesn't supply a stop_anchor (e.g. the REST-poll fallback
-    path, where anchor == average cost anyway since it only ever fires on a single fill).
+    Place SL-Limit order at `multiplier` x ATR from the stop anchor (Turtle-style: the
+    most recent entry price when pyramiding into a winner, not the blended average cost —
+    so the stop ratchets toward each new add instead of loosening back to the average).
+    Falls back to average_price if the caller doesn't supply a stop_anchor (e.g. the
+    REST-poll fallback path, where anchor == average cost anyway since it only ever fires
+    on a single fill). `multiplier` is normally VIX-adaptive — see compute_vix_atr_multiplier.
     """
     symbol  = pos["tradingsymbol"]
     qty     = pos["quantity"]
     anchor  = pos.get("stop_anchor", pos["average_price"])
-    sl_dist = 2 * atr
+    sl_dist = multiplier * atr
 
     if qty > 0:  # LONG — sell SL below the anchor
         tx            = kite.TRANSACTION_TYPE_SELL
@@ -399,11 +428,23 @@ def _ensure_sl_order(kite: KiteConnect, tracker: "PositionTracker", token: int, 
         direction = "LONG" if pos["quantity"] > 0 else "SHORT"
         atr = _fetch_atr(kite, token, symbol)
         atr_line = f"5-min ATR (14): Rs {atr}" if atr else "ATR unavailable"
+
+        current_vix = _fetch_india_vix(kite)
+        if current_vix is None:
+            log.warning("India VIX unavailable for %s — falling back to base multiplier %.2f.", symbol, ATR_BASE_MULTIPLIER)
+        multiplier = compute_vix_atr_multiplier(current_vix) if current_vix is not None else ATR_BASE_MULTIPLIER
+
         sl_line = ""
         if atr:
+            sl_dist = multiplier * atr
+            log.info(
+                "SL sizing for %s: VIX=%s multiplier=%.2f atr=Rs %.2f sl_dist=Rs %.2f",
+                symbol, f"{current_vix:.2f}" if current_vix is not None else "unavailable", multiplier, atr, sl_dist,
+            )
             try:
-                trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr)
-                sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price}"
+                trigger, limit_price, order_ids = _place_sl_order(kite, pos, atr, multiplier)
+                vix_line = f"VIX {current_vix:.2f} -> {multiplier:.2f}x ATR" if current_vix is not None else f"VIX unavailable -> {multiplier:.2f}x ATR (fallback)"
+                sl_line = f"SL order placed: trigger Rs {trigger} | limit Rs {limit_price} ({vix_line})"
             except Exception as exc:
                 log.error("SL order failed for %s: %s", symbol, exc)
                 sl_line = f"SL order FAILED: {exc}"
@@ -1635,6 +1676,11 @@ SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
     "strangle_sl_multiplier": ("STRANGLE_SL_MULTIPLIER", float),
     "strangle_lots": ("STRANGLE_LOTS", int),
     "cooloff_minutes": ("COOLOFF_MINUTES", int),
+    "atr_base_multiplier": ("ATR_BASE_MULTIPLIER", float),
+    "atr_reference_vix": ("ATR_REFERENCE_VIX", float),
+    "atr_vix_sensitivity": ("ATR_VIX_SENSITIVITY", float),
+    "atr_min_multiplier": ("ATR_MIN_MULTIPLIER", float),
+    "atr_max_multiplier": ("ATR_MAX_MULTIPLIER", float),
 }
 
 
