@@ -28,6 +28,8 @@ load_dotenv()
 
 STRANGLE_STRIKE_OFFSET = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))
 STRANGLE_SL_MULTIPLIER = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.5"))
+STRANGLE_LOTS = int(os.getenv("STRANGLE_LOTS", "5"))
+STRANGLE_0DTE_LOT_FRACTION = float(os.getenv("STRANGLE_0DTE_LOT_FRACTION", "0.5"))
 WEBSOCKET_FILE = Path(__file__).parent / "with-websockets" / "pnl_monitor.py"
 
 failures = []
@@ -179,6 +181,17 @@ entry_price = 42.55
 trigger = round(entry_price * STRANGLE_SL_MULTIPLIER, 1)
 check(f"trigger = entry * {STRANGLE_SL_MULTIPLIER}", trigger == round(entry_price * STRANGLE_SL_MULTIPLIER, 1))
 check("trigger is above entry (short leg, stop on the way up)", trigger > entry_price)
+
+
+# ============================================================
+# 5. 0DTE lot-fraction math sanity check
+# ============================================================
+print("\n=== 5. 0DTE LOT FRACTION ===\n")
+
+lots_0dte = max(1, int(STRANGLE_LOTS * STRANGLE_0DTE_LOT_FRACTION))
+check(f"0DTE lots ({lots_0dte}) < normal lots ({STRANGLE_LOTS})", lots_0dte < STRANGLE_LOTS or STRANGLE_LOTS == 1)
+check("0DTE lots floor of 1 even at a tiny STRANGLE_LOTS", max(1, int(1 * STRANGLE_0DTE_LOT_FRACTION)) == 1)
+check("0DTE fraction of 0.5 on the default 5 lots rounds down to 2", max(1, int(5 * 0.5)) == 2)
 
 
 # ============================================================

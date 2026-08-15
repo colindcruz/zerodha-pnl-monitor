@@ -95,6 +95,12 @@ STRANGLE_EXIT_TIME           = (15, 0)   # HH, MM IST — square off any legs st
 STRANGLE_STRIKE_OFFSET       = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))    # 1-strike-OTM on NIFTY's 50-pt strikes
 STRANGLE_SL_MULTIPLIER       = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.0"))  # regime-dependent (backtested 2.0-3.0x, 2.0 had the best combined return/drawdown across both tested years) — tune via /set, not a fixed truth
 STRANGLE_LOTS                = int(os.getenv("STRANGLE_LOTS", "5"))
+# On a 0DTE day (the sold contract expires that same day), margin required per lot rises
+# considerably vs. a normal day — write fewer lots that day. Expressed as a fraction of
+# STRANGLE_LOTS (not an absolute number) so it stays in sync if STRANGLE_LOTS changes.
+# Starting value from a rough read on the margin jump — check actual margin on the next
+# few 0DTE days and tune via /set strangle_0dte_lot_fraction once real numbers are in.
+STRANGLE_0DTE_LOT_FRACTION   = float(os.getenv("STRANGLE_0DTE_LOT_FRACTION", "0.5"))
 STRANGLE_PRODUCT             = "NRML"
 STRANGLE_ENTRY_BUFFER_PCT    = float(os.getenv("STRANGLE_ENTRY_BUFFER_PCT", "0.01"))
 STRANGLE_ENTRY_RETRY_SECONDS = int(os.getenv("STRANGLE_ENTRY_RETRY_SECONDS", "20"))
@@ -704,6 +710,14 @@ def enter_strangle(kite: KiteConnect, tracker: "PositionTracker") -> None:
         notify("🚨 Strangle entry FAILED", "Could not resolve strikes/expiry — no strangle entered today. Check logs.", priority="urgent")
         return
 
+    is_0dte = legs["expiry"] == date.today().isoformat()
+    if is_0dte:
+        lots = max(1, int(STRANGLE_LOTS * STRANGLE_0DTE_LOT_FRACTION))
+        log.info("0DTE day (expiry=%s) — using %d lots instead of the normal %d (fraction=%.2f).",
+                  legs["expiry"], lots, STRANGLE_LOTS, STRANGLE_0DTE_LOT_FRACTION)
+    else:
+        lots = STRANGLE_LOTS
+
     with tracker.strangle_lock:
         state["spot_at_entry"] = legs["spot"]
         state["expiry"] = legs["expiry"]
@@ -714,12 +728,19 @@ def enter_strangle(kite: KiteConnect, tracker: "PositionTracker") -> None:
             leg["instrument_token"] = info["instrument_token"]
             leg["strike"] = info["strike"]
             leg["lot_size"] = info["lot_size"]
-            leg["qty"] = info["lot_size"] * STRANGLE_LOTS
+            leg["qty"] = info["lot_size"] * lots
             tracker.strangle_symbols.add(info["tradingsymbol"])
         save_strangle_state(state)
 
     log.info("Strangle legs resolved: spot=%.2f expiry=%s CE=%s PE=%s",
               legs["spot"], legs["expiry"], legs["CE"]["tradingsymbol"], legs["PE"]["tradingsymbol"])
+    if is_0dte:
+        notify(
+            "⚠️ 0DTE day — reduced lot size",
+            f"Today's contract expires today. Writing {lots} lots instead of the normal {STRANGLE_LOTS} "
+            f"({STRANGLE_0DTE_LOT_FRACTION:.0%} of normal, margin runs higher on 0DTE — tune via "
+            f"/set strangle_0dte_lot_fraction once you've checked actual margin numbers).",
+        )
 
     for leg_key in ("CE", "PE"):
         leg = state["legs"][leg_key]
@@ -2001,7 +2022,7 @@ def _compute_strangle_pnl(kite: KiteConnect, tracker: "PositionTracker") -> floa
         symbol = leg.get("tradingsymbol")
         if not symbol or leg.get("entry_price") is None or not leg.get("lot_size"):
             continue
-        qty = leg["lot_size"] * STRANGLE_LOTS
+        qty = leg.get("qty") or (leg["lot_size"] * STRANGLE_LOTS)  # qty is set at entry; live global is only a pre-entry fallback
         if leg["status"] == "open":
             cur = live_ltp.get(symbol)
             if cur is not None:
@@ -2046,7 +2067,7 @@ def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str
         entry_str = f"Rs {leg['entry_price']:.2f}" if leg.get("entry_price") is not None else "pending"
         sl_str = f"Rs {leg['sl_trigger']:.2f}" if leg.get("sl_trigger") is not None else "none"
         lines.append(f"{leg_key} {leg['tradingsymbol']}: entry {entry_str} | now {cur_str} | SL {sl_str} | {leg['status']}")
-        qty = (leg.get("lot_size") or 0) * STRANGLE_LOTS
+        qty = leg.get("qty") or ((leg.get("lot_size") or 0) * STRANGLE_LOTS)  # qty is set at entry; live global is only a pre-entry fallback
         if leg.get("entry_price") is not None and qty:
             if leg["status"] == "open" and cur is not None:
                 total_pnl += (leg["entry_price"] - cur) * qty
@@ -2198,6 +2219,7 @@ SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
     "exit_buffer_seconds": ("EXIT_BUFFER_SECONDS", int),
     "strangle_sl_multiplier": ("STRANGLE_SL_MULTIPLIER", float),
     "strangle_lots": ("STRANGLE_LOTS", int),
+    "strangle_0dte_lot_fraction": ("STRANGLE_0DTE_LOT_FRACTION", float),
     "cooloff_minutes": ("COOLOFF_MINUTES", int),
     "atr_base_multiplier": ("ATR_BASE_MULTIPLIER", float),
     "atr_reference_vix": ("ATR_REFERENCE_VIX", float),

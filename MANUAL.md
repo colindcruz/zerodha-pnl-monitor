@@ -211,7 +211,8 @@ clamped to `[ATR_MIN_MULTIPLIER, ATR_MAX_MULTIPLIER]`. If the India VIX quote fa
 | `STRANGLE_ENABLED` | Master switch for the whole feature | `true` | `true` |
 | `STRANGLE_STRIKE_OFFSET` | How far out-of-the-money to sell, in NIFTY strike points | `50` | `50` |
 | `STRANGLE_SL_MULTIPLIER` | Stop-loss trigger = entry premium × this. E.g. `2.0` means the SL fires if the option's price doubles from what you sold it for | `2.0` | `2.0` |
-| `STRANGLE_LOTS` | Number of lots per leg | `5` | `5` |
+| `STRANGLE_LOTS` | Number of lots per leg on a normal day | `5` | `5` |
+| `STRANGLE_0DTE_LOT_FRACTION` | On a 0DTE day (sold contract expires that same day, margin runs higher), lots = `STRANGLE_LOTS × this`, rounded down, floor of 1 lot | `0.5` | `0.5` |
 | `STRANGLE_ENTRY_BUFFER_PCT` | How aggressive the entry/exit limit order price is, as a % off the live price | `0.01` (1%) | `0.01` |
 | `STRANGLE_ENTRY_RETRY_SECONDS` | Seconds between entry-order retry attempts if a leg hasn't filled | `20` | `20` |
 | `STRANGLE_ENTRY_MAX_RETRIES` | How many times to retry an unfilled leg before giving up | `3` | `3` |
@@ -364,6 +365,7 @@ Cool-off: new positions auto-squared-off until 14:12:11
 ### Auto-strangle
 
 - Between **9:23 AM and 9:35 AM**, if enabled and not already attempted today, the script resolves the nearest NIFTY expiry and the strikes `STRANGLE_STRIKE_OFFSET` points away from spot on each side, and sells one call and one put.
+- **0DTE days** (the resolved expiry is today's date) write fewer lots — `STRANGLE_LOTS × STRANGLE_0DTE_LOT_FRACTION`, rounded down, floor of 1 — since margin required runs considerably higher that close to expiry. You get an alert when this kicks in. `STRANGLE_0DTE_LOT_FRACTION`'s default (0.5) is a rough starting estimate — check actual margin on the next few 0DTE days and tune it via `/set strangle_0dte_lot_fraction`.
 - If a leg's order doesn't fill, it's retried up to `STRANGLE_ENTRY_MAX_RETRIES` times (every `STRANGLE_ENTRY_RETRY_SECONDS`) with a progressively wider limit price. If the 9:35 AM cutoff passes with a leg still unfilled, the system **gives up** and sends an urgent alert — it does **not** fall back to a market order, and does **not** try to fix an imbalance if only one leg filled (e.g. from insufficient margin on the other). That's a deliberate design choice, not a bug — it means asymmetric or incomplete entries need a manual look via `/strangle_status`.
 - Each filled leg gets its own stop-loss at `entry price × STRANGLE_SL_MULTIPLIER`.
 - At **3:00 PM**, any strangle leg still open is squared off automatically.
