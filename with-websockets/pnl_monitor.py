@@ -93,7 +93,20 @@ STRANGLE_ENTRY_TIME          = (9, 23)   # HH, MM IST — entry window opens
 STRANGLE_HEADSUP_TIME        = (9, 21)   # HH, MM IST — 2 min heads-up alert before entry
 STRANGLE_ENTRY_CUTOFF        = (9, 35)   # entry window closes; give up + alert if not done by then
 STRANGLE_EXIT_TIME           = (15, 0)   # HH, MM IST — square off any legs still open
-STRANGLE_STRIKE_OFFSET       = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))    # 1-strike-OTM on NIFTY's 50-pt strikes
+STRANGLE_STRIKE_OFFSET       = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))    # NIFTY's 50-pt strike step — used for ATM rounding and as the delta-search ladder's step size (see STRANGLE_TARGET_DELTA below); also reused by the hedge feature's own ATM rounding
+# Strikes are chosen so each side's *live* delta magnitude is close to this target,
+# independently recomputed each day from that day's actual option prices (self-corrects
+# for whatever skew shows up, unlike a fixed points offset — a fixed offset was found to
+# produce badly unequal deltas, e.g. 0.489 CE vs -0.336 PE on one measured day). Default
+# is informed by a 3-day backtest this session (25-delta beat the old fixed-50pt offset
+# on 2 of 3 days, lost only on a quiet/range-bound day; 16-delta never won) — a reasoned
+# starting point given the evidence available, not a validated optimum. Tune via /set.
+STRANGLE_TARGET_DELTA        = float(os.getenv("STRANGLE_TARGET_DELTA", "0.25"))
+# How many strikes out from ATM (in STRANGLE_STRIKE_OFFSET steps) to search for the
+# target-delta strike before giving up. 20 steps * 50 pts = up to 1000 pts out, the same
+# order of magnitude as HEDGE_STRIKE_OFFSET's "far OTM" default — comfortably wide for
+# any realistic target delta at normal weekly-expiry IV.
+STRANGLE_DELTA_SEARCH_STRIKES = int(os.getenv("STRANGLE_DELTA_SEARCH_STRIKES", "20"))
 STRANGLE_SL_MULTIPLIER       = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.0"))  # regime-dependent (backtested 2.0-3.0x, 2.0 had the best combined return/drawdown across both tested years) — tune via /set, not a fixed truth
 STRANGLE_LOTS                = int(os.getenv("STRANGLE_LOTS", "5"))
 # On a 0DTE day (the sold contract expires that same day), margin required per lot rises
@@ -239,6 +252,10 @@ def _default_leg() -> dict:
         "lot_size": None, "qty": None,
         "entry_order_id": None, "entry_status": "pending",  # pending|order_placed|filled|failed
         "entry_price": None,
+        # Delta/IV as resolved at entry time (None on 0DTE days, which skip delta-
+        # targeting — see _resolve_strangle_legs). A snapshot, like entry_price — not
+        # live-recomputed on every status check.
+        "delta_at_entry": None, "iv_at_entry": None,
         "sl_order_id": None, "sl_trigger": None,
         "status": "pending",  # pending|open|sl_hit|closed_eod|closed_manual|closed_other|failed
         "exit_price": None, "closed_at": None,
@@ -558,15 +575,47 @@ def _get_lot_sizes(kite: KiteConnect, symbols: list[str]) -> dict[str, int]:
         return {}
 
 
+def _best_delta_match(candidates: list[dict], ltp_data: dict, spot: float, T: float,
+                       is_call: bool, target_delta: float) -> dict | None:
+    """Among `candidates` (dicts with tradingsymbol/instrument_token/strike/lot_size),
+    returns the one whose live-implied delta magnitude is closest to `target_delta`,
+    with 'delta' and 'iv' added — or None if no candidate's price yielded a solvable IV
+    (missing quote, or T<=0). Uses this file's existing _implied_vol/_bs_greeks (also
+    what /greeks reports), so the delta shown at entry never disagrees with what /greeks
+    reports for the same position later."""
+    best, best_diff = None, None
+    for c in candidates:
+        price = ltp_data.get(f"NFO:{c['tradingsymbol']}", {}).get("last_price")
+        if not price:
+            continue
+        iv = _implied_vol(price, spot, c["strike"], T, RISK_FREE_RATE, is_call)
+        if iv is None:
+            continue
+        delta = _bs_greeks(spot, c["strike"], T, RISK_FREE_RATE, iv, is_call)["delta"]
+        diff = abs(abs(delta) - target_delta)
+        if best is None or diff < best_diff:
+            best, best_diff = {**c, "delta": delta, "iv": iv}, diff
+    return best
+
+
 def _resolve_strangle_legs(kite: KiteConnect) -> dict | None:
     """
-    Resolves today's 1-strike-OTM NIFTY strangle: current spot, ATM strike, and the
-    exact CE/PE tradingsymbols for the nearest expiry. Uses "earliest expiry >= today
-    across all NIFTY option rows" rather than a weekday assumption (NSE's weekly-expiry
-    weekday has changed before and could again) — a monthly contract's expiry is always
-    itself the final weekly expiry of that month, so this is correct regardless of
-    whatever cadence is in effect. Returns None (and logs why) if spot or either strike
-    can't be resolved — never guesses a nearby strike.
+    Resolves today's NIFTY strangle: current spot, ATM strike, and the exact CE/PE
+    tradingsymbols for the nearest expiry, each chosen so its live delta magnitude is
+    close to STRANGLE_TARGET_DELTA (independently per side, self-correcting for
+    whatever skew shows up that day — a fixed points offset does not). Uses "earliest
+    expiry >= today across all NIFTY option rows" rather than a weekday assumption
+    (NSE's weekly-expiry weekday has changed before and could again) — a monthly
+    contract's expiry is always itself the final weekly expiry of that month, so this is
+    correct regardless of whatever cadence is in effect. Returns None (and logs why) if
+    spot, expiry, or either strike can't be resolved — never guesses a nearby strike.
+
+    0DTE (expiry == today) is a deliberate exception: at T=0 _implied_vol always returns
+    None (same-day options have no solvable time value under this file's day-granularity
+    T formula — the same approximation /greeks already uses elsewhere), so delta-search
+    would fail for every candidate. Rather than a second, more precise intraday-T formula
+    that would make this function's delta disagree with what /greeks reports for the
+    same position minutes later, 0DTE falls back to the original fixed-offset behavior.
     """
     try:
         spot = kite.ltp([INDEX_SPOT_SYMBOLS["NIFTY"]])[INDEX_SPOT_SYMBOLS["NIFTY"]]["last_price"]
@@ -575,8 +624,6 @@ def _resolve_strangle_legs(kite: KiteConnect) -> dict | None:
         return None
 
     atm = round(spot / STRANGLE_STRIKE_OFFSET) * STRANGLE_STRIKE_OFFSET
-    ce_strike = atm + STRANGLE_STRIKE_OFFSET
-    pe_strike = atm - STRANGLE_STRIKE_OFFSET
 
     try:
         instruments = kite.instruments("NFO")
@@ -608,12 +655,42 @@ def _resolve_strangle_legs(kite: KiteConnect) -> dict | None:
                 }
         return None
 
-    ce = _find(ce_strike, "CE")
-    pe = _find(pe_strike, "PE")
-    if not ce or not pe:
-        log.error("Could not resolve strangle legs for expiry %s: CE %s found=%s, PE %s found=%s",
-                   expiry, ce_strike, bool(ce), pe_strike, bool(pe))
+    if expiry == today:
+        log.info("0DTE day (expiry=%s) — delta-targeting isn't meaningful at same-day "
+                  "expiry (T=0), using the fixed %d-point offset instead.", expiry, STRANGLE_STRIKE_OFFSET)
+        ce = _find(atm + STRANGLE_STRIKE_OFFSET, "CE")
+        pe = _find(atm - STRANGLE_STRIKE_OFFSET, "PE")
+        if not ce or not pe:
+            log.error("Could not resolve 0DTE strangle legs for expiry %s: CE found=%s, PE found=%s",
+                       expiry, bool(ce), bool(pe))
+            return None
+        return {"expiry": expiry.isoformat(), "spot": spot, "CE": ce, "PE": pe}
+
+    T = max((expiry - today).days, 0) / 365
+
+    ce_candidates = [leg for n in range(1, STRANGLE_DELTA_SEARCH_STRIKES + 1)
+                     if (leg := _find(atm + n * STRANGLE_STRIKE_OFFSET, "CE"))]
+    pe_candidates = [leg for n in range(1, STRANGLE_DELTA_SEARCH_STRIKES + 1)
+                     if (leg := _find(atm - n * STRANGLE_STRIKE_OFFSET, "PE"))]
+
+    all_symbols = [f"NFO:{c['tradingsymbol']}" for c in ce_candidates + pe_candidates]
+    try:
+        ltp_data = kite.ltp(all_symbols) if all_symbols else {}
+    except Exception as exc:
+        log.error("Could not fetch candidate strike LTPs for strangle delta-resolution: %s", exc)
         return None
+
+    ce = _best_delta_match(ce_candidates, ltp_data, spot, T, True, STRANGLE_TARGET_DELTA)
+    pe = _best_delta_match(pe_candidates, ltp_data, spot, T, False, STRANGLE_TARGET_DELTA)
+    if not ce or not pe:
+        log.error("Could not resolve target-delta (%.2f) strangle legs for expiry %s: CE found=%s, PE found=%s",
+                   STRANGLE_TARGET_DELTA, expiry, bool(ce), bool(pe))
+        return None
+
+    log.info("Delta-targeted strangle legs: CE %s (strike=%s Δ=%.3f IV=%.1f%%), "
+              "PE %s (strike=%s Δ=%.3f IV=%.1f%%)",
+              ce["tradingsymbol"], ce["strike"], ce["delta"], ce["iv"] * 100,
+              pe["tradingsymbol"], pe["strike"], pe["delta"], pe["iv"] * 100)
 
     return {"expiry": expiry.isoformat(), "spot": spot, "CE": ce, "PE": pe}
 
@@ -731,6 +808,8 @@ def enter_strangle(kite: KiteConnect, tracker: "PositionTracker") -> None:
             leg["strike"] = info["strike"]
             leg["lot_size"] = info["lot_size"]
             leg["qty"] = info["lot_size"] * lots
+            leg["delta_at_entry"] = info.get("delta")  # None on 0DTE days (no delta-targeting — see _resolve_strangle_legs)
+            leg["iv_at_entry"] = info.get("iv")
             tracker.strangle_symbols.add(info["tradingsymbol"])
         save_strangle_state(state)
 
@@ -766,10 +845,15 @@ def enter_strangle(kite: KiteConnect, tracker: "PositionTracker") -> None:
         symbols_line = " & ".join(
             f"{state['legs'][k]['tradingsymbol']} x{state['legs'][k]['qty']}" for k in placed
         )
+        delta_line = ""
+        if not is_0dte:
+            deltas = " ".join(f"{k} Δ{legs[k]['delta']:.2f}" for k in placed if legs[k].get("delta") is not None)
+            if deltas:
+                delta_line = f"\n{deltas} (target {STRANGLE_TARGET_DELTA:.2f})"
         notify(
             "🦅 Strangle entry orders placed",
             f"SOLD {symbols_line}\n"
-            f"Spot: Rs {legs['spot']:.2f} | Expiry: {legs['expiry']}\nAwaiting fill confirmation...",
+            f"Spot: Rs {legs['spot']:.2f} | Expiry: {legs['expiry']}{delta_line}\nAwaiting fill confirmation...",
         )
 
     # Retry loop: widen the limit buffer for any leg still unfilled, up to STRANGLE_ENTRY_MAX_RETRIES.
@@ -2068,7 +2152,8 @@ def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str
         cur_str = f"Rs {cur:.2f}" if cur is not None else "n/a"
         entry_str = f"Rs {leg['entry_price']:.2f}" if leg.get("entry_price") is not None else "pending"
         sl_str = f"Rs {leg['sl_trigger']:.2f}" if leg.get("sl_trigger") is not None else "none"
-        lines.append(f"{leg_key} {leg['tradingsymbol']}: entry {entry_str} | now {cur_str} | SL {sl_str} | {leg['status']}")
+        delta_str = f"Δ{leg['delta_at_entry']:.2f}" if leg.get("delta_at_entry") is not None else "Δn/a (0DTE)"
+        lines.append(f"{leg_key} {leg['tradingsymbol']}: entry {entry_str} | now {cur_str} | SL {sl_str} | {delta_str} | {leg['status']}")
         qty = leg.get("qty") or ((leg.get("lot_size") or 0) * STRANGLE_LOTS)  # qty is set at entry; live global is only a pre-entry fallback
         if leg.get("entry_price") is not None and qty:
             if leg["status"] == "open" and cur is not None:
@@ -2081,7 +2166,7 @@ def format_strangle_status(kite: KiteConnect, tracker: "PositionTracker") -> str
     entry_state = "completed" if state.get("entry_completed") else "incomplete"
     eod_state = "done" if state.get("eod_square_off_completed") else ("attempted" if state.get("eod_square_off_attempted") else "pending")
     lines.append(f"Entry: {entry_state}  |  EOD square-off: {eod_state}")
-    lines.append(f"Auto-entry: {'PAUSED' if PAUSE_STRANGLE_FILE.exists() else 'enabled'}  |  SL multiplier: {STRANGLE_SL_MULTIPLIER}x")
+    lines.append(f"Auto-entry: {'PAUSED' if PAUSE_STRANGLE_FILE.exists() else 'enabled'}  |  SL multiplier: {STRANGLE_SL_MULTIPLIER}x  |  Target delta: {STRANGLE_TARGET_DELTA:.2f}")
     return "\n".join(lines)
 
 
@@ -2222,6 +2307,8 @@ SETTABLE_PARAMS: dict[str, tuple[str, type]] = {
     "strangle_sl_multiplier": ("STRANGLE_SL_MULTIPLIER", float),
     "strangle_lots": ("STRANGLE_LOTS", int),
     "strangle_0dte_lot_fraction": ("STRANGLE_0DTE_LOT_FRACTION", float),
+    "strangle_target_delta": ("STRANGLE_TARGET_DELTA", float),
+    "strangle_delta_search_strikes": ("STRANGLE_DELTA_SEARCH_STRIKES", int),
     "cooloff_minutes": ("COOLOFF_MINUTES", int),
     "atr_base_multiplier": ("ATR_BASE_MULTIPLIER", float),
     "atr_reference_vix": ("ATR_REFERENCE_VIX", float),

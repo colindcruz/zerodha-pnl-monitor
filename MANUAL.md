@@ -209,7 +209,9 @@ clamped to `[ATR_MIN_MULTIPLIER, ATR_MAX_MULTIPLIER]`. If the India VIX quote fa
 | Variable | Purpose | Default | Example |
 |---|---|---|---|
 | `STRANGLE_ENABLED` | Master switch for the whole feature | `true` | `true` |
-| `STRANGLE_STRIKE_OFFSET` | How far out-of-the-money to sell, in NIFTY strike points | `50` | `50` |
+| `STRANGLE_STRIKE_OFFSET` | NIFTY's strike step in points — used for ATM rounding and as the delta-search ladder's step size, not "how far OTM to sell" (that's now delta-driven, see below) | `50` | `50` |
+| `STRANGLE_TARGET_DELTA` | Each side's strike is chosen so its live delta magnitude is close to this, independently per side — recomputed from real option prices every entry, so it self-corrects for that day's actual skew (a fixed points offset does not) | `0.25` | `0.25` |
+| `STRANGLE_DELTA_SEARCH_STRIKES` | How many strikes out from ATM to search for the target-delta strike before giving up | `20` | `20` |
 | `STRANGLE_SL_MULTIPLIER` | Stop-loss trigger = entry premium × this. E.g. `2.0` means the SL fires if the option's price doubles from what you sold it for | `2.0` | `2.0` |
 | `STRANGLE_LOTS` | Number of lots per leg on a normal day | `5` | `5` |
 | `STRANGLE_0DTE_LOT_FRACTION` | On a 0DTE day (sold contract expires that same day, margin runs higher), lots = `STRANGLE_LOTS × this`, rounded down, floor of 1 lot | `0.5` | `0.5` |
@@ -365,7 +367,7 @@ Cool-off: new positions auto-squared-off until 14:12:11
 ### Auto-strangle
 
 - At **9:21 AM** (2 minutes before entry), a heads-up alert fires if entry is actually going to be attempted today (same gating as the real entry below — you won't get a heads-up on a paused/holiday/already-done day).
-- Between **9:23 AM and 9:35 AM**, if enabled and not already attempted today, the script resolves the nearest NIFTY expiry and the strikes `STRANGLE_STRIKE_OFFSET` points away from spot on each side, and sells one call and one put.
+- Between **9:23 AM and 9:35 AM**, if enabled and not already attempted today, the script resolves the nearest NIFTY expiry and, on each side independently, the strike whose live delta magnitude is closest to `STRANGLE_TARGET_DELTA` (falling back to a fixed `STRANGLE_STRIKE_OFFSET`-point offset on 0DTE days, where delta-targeting isn't meaningful at same-day expiry), and sells one call and one put.
 - **0DTE days** (the resolved expiry is today's date) write fewer lots — `STRANGLE_LOTS × STRANGLE_0DTE_LOT_FRACTION`, rounded down, floor of 1 — since margin required runs considerably higher that close to expiry. You get an alert when this kicks in. `STRANGLE_0DTE_LOT_FRACTION`'s default (0.5) is a rough starting estimate — check actual margin on the next few 0DTE days and tune it via `/set strangle_0dte_lot_fraction`.
 - If a leg's order doesn't fill, it's retried up to `STRANGLE_ENTRY_MAX_RETRIES` times (every `STRANGLE_ENTRY_RETRY_SECONDS`) with a progressively wider limit price. If the 9:35 AM cutoff passes with a leg still unfilled, the system **gives up** and sends an urgent alert — it does **not** fall back to a market order, and does **not** try to fix an imbalance if only one leg filled (e.g. from insufficient margin on the other). That's a deliberate design choice, not a bug — it means asymmetric or incomplete entries need a manual look via `/strangle_status`.
 - Each filled leg gets its own stop-loss at `entry price × STRANGLE_SL_MULTIPLIER`.
@@ -444,7 +446,7 @@ Systemd restarts the service automatically if it crashes. On every startup, befo
 
 **Safe to change any time, via Telegram — no restart needed:**
 
-Send `/set` alone to list every live-tunable value with its current setting, or `/set <name> <value>` to change one on the fly, e.g. `/set loss_limit -50000`. The full list of tunable names: `loss_warning_1`, `loss_warning_2`, `loss_limit`, `profit_target`, `trail_activation`, `green_day_activation`, `green_day_floor`, `milestone_step`, `max_position_qty`, `hedge_price_threshold`, `exit_buffer_seconds`, `strangle_sl_multiplier`, `strangle_lots`, `cooloff_minutes`.
+Send `/set` alone to list every live-tunable value with its current setting, or `/set <name> <value>` to change one on the fly, e.g. `/set loss_limit -50000`. The full list of tunable names: `loss_warning_1`, `loss_warning_2`, `loss_limit`, `profit_target`, `trail_activation`, `green_day_activation`, `green_day_floor`, `milestone_step`, `max_position_qty`, `hedge_price_threshold`, `exit_buffer_seconds`, `strangle_sl_multiplier`, `strangle_lots`, `strangle_target_delta`, `strangle_delta_search_strikes`, `cooloff_minutes`.
 
 **Safe to change in `.env`, but requires a `systemctl restart pnl-monitor` to take effect:** everything else listed in section 4's tables (e.g. `TRAIL_CHECK_INTERVAL`, `STRANGLE_STRIKE_OFFSET`, `NTFY_TOPIC`, `MILESTONE_STEP` as a starting default before your first `/set` override, etc.).
 

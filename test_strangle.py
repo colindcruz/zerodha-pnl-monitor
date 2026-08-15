@@ -27,9 +27,12 @@ from kiteconnect import KiteConnect
 load_dotenv()
 
 STRANGLE_STRIKE_OFFSET = int(os.getenv("STRANGLE_STRIKE_OFFSET", "50"))
+STRANGLE_TARGET_DELTA = float(os.getenv("STRANGLE_TARGET_DELTA", "0.25"))
+STRANGLE_DELTA_SEARCH_STRIKES = int(os.getenv("STRANGLE_DELTA_SEARCH_STRIKES", "20"))
 STRANGLE_SL_MULTIPLIER = float(os.getenv("STRANGLE_SL_MULTIPLIER", "2.5"))
 STRANGLE_LOTS = int(os.getenv("STRANGLE_LOTS", "5"))
 STRANGLE_0DTE_LOT_FRACTION = float(os.getenv("STRANGLE_0DTE_LOT_FRACTION", "0.5"))
+RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.065"))
 WEBSOCKET_FILE = Path(__file__).parent / "with-websockets" / "pnl_monitor.py"
 
 failures = []
@@ -41,6 +44,63 @@ def _connect_kite():
     kite = KiteConnect(api_key=os.environ["KITE_API_KEY"])
     kite.set_access_token(Path(os.getenv("ACCESS_TOKEN_PATH", ".access_token")).read_text().strip())
     return kite
+
+
+# Mirrors with-websockets/pnl_monitor.py:1602-1651 verbatim — kept in sync manually,
+# not imported, matching this file's existing style of reimplementing production
+# formulas locally rather than importing (importing pnl_monitor.py would also require
+# TELEGRAM_* env vars just to run this dry-run, which today's Section 1 doesn't need).
+import math
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-x * x / 2) / math.sqrt(2 * math.pi)
+
+
+def _bs_price(S, K, T, r, sigma, is_call) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def _implied_vol(price, S, K, T, r, is_call) -> float | None:
+    if T <= 0 or price <= 0:
+        return None
+    lo, hi = 0.001, 5.0
+    if _bs_price(S, K, T, r, hi, is_call) < price:
+        return None
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if _bs_price(S, K, T, r, mid, is_call) > price:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def _bs_greeks(S, K, T, r, sigma, is_call) -> dict:
+    if T <= 0 or sigma <= 0:
+        itm = (S > K) if is_call else (S < K)
+        return {"delta": (1.0 if is_call else -1.0) if itm else 0.0, "theta": 0.0, "vega": 0.0}
+    d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    pdf_d1 = _norm_pdf(d1)
+    vega = S * pdf_d1 * math.sqrt(T) / 100
+    if is_call:
+        delta = _norm_cdf(d1)
+        theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * _norm_cdf(d2)) / 365
+    else:
+        delta = _norm_cdf(d1) - 1
+        theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * _norm_cdf(-d2)) / 365
+    return {"delta": delta, "theta": theta, "vega": vega}
 
 
 def check(label: str, condition: bool, detail: str = ""):
@@ -93,6 +153,65 @@ if kite:
             print(f"  PE: {pe['tradingsymbol']} (lot_size={pe['lot_size']})")
             check("CE and PE lot sizes match", ce["lot_size"] == pe["lot_size"])
 
+            # ---- Delta-targeted resolution (the actual production logic) ----
+            print(f"\n--- Delta-targeted resolution (target={STRANGLE_TARGET_DELTA}) ---\n")
+            is_0dte = expiry == today
+            if is_0dte:
+                print(f"  ⏭  0DTE today (expiry={expiry}) — delta-targeting falls back to the fixed "
+                      f"{STRANGLE_STRIKE_OFFSET}pt offset by design (T=0, no solvable IV). Nothing further to check.")
+            else:
+                T = max((expiry - today).days, 0) / 365
+
+                def _find(strike, opt_type):
+                    return next((i for i in nifty_options if _norm_expiry(i) == expiry
+                                 and float(i["strike"]) == strike and i["instrument_type"] == opt_type), None)
+
+                ce_candidates = [c for n in range(1, STRANGLE_DELTA_SEARCH_STRIKES + 1)
+                                  if (c := _find(atm + n * STRANGLE_STRIKE_OFFSET, "CE"))]
+                pe_candidates = [c for n in range(1, STRANGLE_DELTA_SEARCH_STRIKES + 1)
+                                  if (c := _find(atm - n * STRANGLE_STRIKE_OFFSET, "PE"))]
+                all_symbols = [f"NFO:{c['tradingsymbol']}" for c in ce_candidates + pe_candidates]
+                ltp_data = kite.ltp(all_symbols) if all_symbols else {}
+
+                def _best_match(candidates, is_call):
+                    best, best_diff = None, None
+                    for c in candidates:
+                        price = ltp_data.get(f"NFO:{c['tradingsymbol']}", {}).get("last_price")
+                        if not price:
+                            continue
+                        iv = _implied_vol(price, spot, c["strike"], T, RISK_FREE_RATE, is_call)
+                        if iv is None:
+                            continue
+                        delta = _bs_greeks(spot, c["strike"], T, RISK_FREE_RATE, iv, is_call)["delta"]
+                        diff = abs(abs(delta) - STRANGLE_TARGET_DELTA)
+                        if best is None or diff < best_diff:
+                            best, best_diff = {**c, "delta": delta, "iv": iv}, diff
+                    return best
+
+                ce_delta = _best_match(ce_candidates, True)
+                pe_delta = _best_match(pe_candidates, False)
+                check(f"CE target-delta strike resolved ({len(ce_candidates)} candidates searched)", ce_delta is not None)
+                check(f"PE target-delta strike resolved ({len(pe_candidates)} candidates searched)", pe_delta is not None)
+                if ce_delta and pe_delta:
+                    print(f"  CE: {ce_delta['tradingsymbol']} strike={ce_delta['strike']} "
+                          f"Δ={ce_delta['delta']:.3f} IV={ce_delta['iv']*100:.1f}%")
+                    print(f"  PE: {pe_delta['tradingsymbol']} strike={pe_delta['strike']} "
+                          f"Δ={pe_delta['delta']:.3f} IV={pe_delta['iv']*100:.1f}%")
+                    imbalance = abs(abs(ce_delta["delta"]) - abs(pe_delta["delta"]))
+                    print(f"  Delta imbalance (|CE|-|PE|): {imbalance:.3f}")
+                    # For comparison: what the OLD fixed-offset strikes' own live delta looks like today —
+                    # this is the number the whole change exists to bring closer to zero.
+                    old_ce_price = kite.ltp([f"NFO:{ce['tradingsymbol']}"]).get(f"NFO:{ce['tradingsymbol']}", {}).get("last_price")
+                    old_pe_price = kite.ltp([f"NFO:{pe['tradingsymbol']}"]).get(f"NFO:{pe['tradingsymbol']}", {}).get("last_price")
+                    old_ce_iv = _implied_vol(old_ce_price, spot, ce_strike, T, RISK_FREE_RATE, True) if old_ce_price else None
+                    old_pe_iv = _implied_vol(old_pe_price, spot, pe_strike, T, RISK_FREE_RATE, False) if old_pe_price else None
+                    if old_ce_iv and old_pe_iv:
+                        old_ce_delta = _bs_greeks(spot, ce_strike, T, RISK_FREE_RATE, old_ce_iv, True)["delta"]
+                        old_pe_delta = _bs_greeks(spot, pe_strike, T, RISK_FREE_RATE, old_pe_iv, False)["delta"]
+                        old_imbalance = abs(abs(old_ce_delta) - abs(old_pe_delta))
+                        print(f"  (for comparison) old fixed-{STRANGLE_STRIKE_OFFSET}pt strikes today: "
+                              f"CE Δ={old_ce_delta:.3f}  PE Δ={old_pe_delta:.3f}  imbalance={old_imbalance:.3f}")
+
 
 # ============================================================
 # 2. State load/save round-trip, including stale-date reset
@@ -104,6 +223,7 @@ def _default_leg():
     return {
         "tradingsymbol": None, "instrument_token": None, "strike": None, "lot_size": None, "qty": None,
         "entry_order_id": None, "entry_status": "pending", "entry_price": None,
+        "delta_at_entry": None, "iv_at_entry": None,
         "sl_order_id": None, "sl_trigger": None, "status": "pending", "exit_price": None, "closed_at": None,
     }
 
