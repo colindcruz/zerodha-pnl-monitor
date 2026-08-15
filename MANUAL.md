@@ -345,6 +345,14 @@ Cool-off: new positions auto-squared-off until 14:12:11
 - At **3:00 PM**, any strangle leg still open is squared off automatically.
 - The strangle's P&L, positions, and safety nets are **fully separate** from the manual-trading system above — a strangle leg is never counted in your manual P&L, never swept by the loss-limit/trailing-lock/profit-target exits, and vice versa.
 
+### Final safety-net (3:01–3:06 PM)
+
+A last-resort backstop, independent of everything above — covers **both** manual and strangle positions, unlike every other auto-exit mechanism in this system (which deliberately keep the two separate). The idea is to catch anything that should already be closed by 3 PM (a manual trailing/loss-limit exit, or the strangle's own 3:00 PM square-off) but somehow wasn't, rather than to be a normal part of the daily routine.
+
+- From **3:01 PM**, if any non-hedge position (manual or strangle) is still open, an urgent warning repeats every 30 seconds telling you to close it.
+- At **3:06 PM**, everything non-hedge still open — manual or strangle — is squared off automatically, whether or not it should have been closed already.
+- This one **ignores `AUTO_EXIT` and the pause files** — it fires regardless, since its entire purpose is to be the backstop for when something else has already failed or been paused. If you deliberately want a position open past 3 PM, this will still close it.
+
 ### Restart mid-day (a real scenario, not hypothetical)
 
 Systemd restarts the service automatically if it crashes. On every startup, before doing anything else, the script cross-checks its saved strangle state file against your *actual live* Zerodha positions and orders — it never blindly trusts what was last written to disk. If anything is ambiguous after a restart, it alerts you rather than guessing. Note, however, that a restart **does wipe all other in-memory tracking** (the trailing-lock peak/floor, which flags have already fired today, etc., for the manual-trading side) — those are not saved to disk and start over on the next check after restart.

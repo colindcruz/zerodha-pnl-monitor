@@ -2051,6 +2051,8 @@ def main():
     last_trailing_heartbeat = 0
     last_heartbeat = time.time()
     eod_summary_sent = False
+    last_final_warning_alert = 0.0
+    final_squareoff_done = False
 
     try:
         while True:
@@ -2122,6 +2124,56 @@ def main():
                 tracker.strangle_state["eod_square_off_attempted"] = True
                 save_strangle_state(tracker.strangle_state)
                 threading.Thread(target=lambda: square_off_strangle(kite, tracker, "eod"), daemon=True).start()
+
+            # ---- Final safety-net: 3:01pm repeating warning, 3:06pm hard auto-square-off.
+            # Backstop for whatever else should already have closed everything by 3pm (manual
+            # trailing/loss-limit/profit-target exits, the strangle's own STRANGLE_EXIT_TIME
+            # square-off) — covers BOTH manual and strangle positions, in case one of those
+            # paths failed for some reason. Unconditional: does not check AUTO_EXIT or the
+            # pause files, since the whole point is to fire even if something else is broken
+            # or paused. Reuses exit_non_hedge_positions with no exclusion, so strangle legs
+            # are swept up here too, unlike every other exit_non_hedge_positions call site.
+            final_warning_start = now_ist.replace(hour=15, minute=1, second=0, microsecond=0)
+            final_squareoff_time = now_ist.replace(hour=15, minute=6, second=0, microsecond=0)
+
+            if (final_warning_start <= now_ist < final_squareoff_time
+                    and now - last_final_warning_alert >= 30):
+                last_final_warning_alert = now
+                try:
+                    net = kite.positions().get("net", [])
+                    open_symbols = [p["tradingsymbol"] for p in net
+                                     if p["quantity"] != 0 and p["last_price"] >= HEDGE_PRICE_THRESHOLD]
+                except Exception as exc:
+                    log.warning("Final safety-net position check failed: %s", exc)
+                    open_symbols = []
+                if open_symbols:
+                    notify(
+                        "🚨 FINAL WARNING — close positions now",
+                        f"Still open past 3:01pm: {', '.join(open_symbols)}\n"
+                        f"Auto square-off (ALL non-hedge positions, manual + strangle) fires at 3:06pm.",
+                        priority="urgent",
+                    )
+
+            if now_ist >= final_squareoff_time and not final_squareoff_done:
+                final_squareoff_done = True
+                log.info("3:06pm final safety-net square-off firing.")
+                try:
+                    exited, skipped, failed = exit_non_hedge_positions(kite)
+                    lines = []
+                    if exited:
+                        lines.append(f"Exited: {', '.join(exited)}")
+                    if skipped:
+                        lines.append(f"Kept (hedge): {', '.join(skipped)}")
+                    if failed:
+                        lines.append(f"FAILED: {', '.join(failed)}")
+                    notify(
+                        "🛑 3:06pm final safety-net square-off executed",
+                        "\n".join(lines) if lines else "No positions to exit.",
+                        priority="urgent",
+                    )
+                except Exception as exc:
+                    log.error("Final safety-net square-off failed: %s", exc)
+                    notify("🛑 Final safety-net square-off ERROR", str(exc), priority="urgent")
 
             # ---- EOD summary: fires once, the first loop iteration after market close ----
             if not eod_summary_sent and not is_market_open():
