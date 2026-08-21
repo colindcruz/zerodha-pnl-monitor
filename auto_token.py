@@ -6,6 +6,7 @@ Saves the access token and restarts the monitor.
 import os
 import sys
 import subprocess
+import time
 import pyotp
 import requests
 from urllib.parse import urlparse, parse_qs
@@ -58,18 +59,24 @@ def run():
     request_id = data["data"]["request_id"]
     print(f"Login successful. request_id: {request_id[:8]}...")
 
-    # Step 2: Submit TOTP
+    # Step 2: Submit TOTP — avoid generating a code right at the edge of its
+    # 30s window, since network latency could land the request in the next
+    # window and get it rejected as invalid.
+    if int(time.time()) % 30 > 25:
+        time.sleep(31 - (int(time.time()) % 30))
     totp_code = pyotp.TOTP(TOTP_SECRET).now()
-    session.post(
+    resp = session.post(
         "https://kite.zerodha.com/api/twofa",
         data={
             "user_id": USER_ID,
             "request_id": request_id,
             "twofa_value": totp_code,
-            "twofa_type": "totp",
         },
         timeout=15,
     )
+    twofa_data = resp.json()
+    if twofa_data.get("status") != "success":
+        raise Exception(f"2FA failed: {twofa_data.get('message', twofa_data)}")
     print("TOTP verified.")
 
     # Step 3: Follow OAuth flow — stop before the final redirect to 127.0.0.1
