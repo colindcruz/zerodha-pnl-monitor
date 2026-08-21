@@ -1648,6 +1648,88 @@ def exit_non_hedge_positions(kite: KiteConnect, exclude_symbols: frozenset = fro
     return exited, skipped, failed
 
 
+def trim_oversize_positions(kite: KiteConnect, exclude_symbols: frozenset, max_qty: int) -> list[dict]:
+    """
+    Fetches a FRESH position snapshot (deliberately not reusing any cached tracker
+    state — this can be called repeatedly a minute apart, and trimming off a stale
+    qty could double-trim a position whose previous trim order hasn't reflected yet).
+    Only considers LONG (bought, quantity > 0) positions — short/sold legs like the
+    strangle are deliberately out of scope, this guards against accidentally buying
+    too much. For any non-excluded long position whose quantity exceeds max_qty,
+    places a SELL limit order for just the excess — same pricing/chunking convention
+    as exit_non_hedge_positions, but leaves max_qty of the position in place instead
+    of exiting it entirely.
+    Returns a list of {"symbol", "excess", "trimmed", "error"} dicts, one per breaching
+    position (error is None on success).
+    """
+    data = kite.positions()
+    net = [p for p in data.get("net", []) if p["quantity"] != 0 and p["tradingsymbol"] not in exclude_symbols]
+    breaching = [
+        p for p in net
+        if p["quantity"] > max_qty and p["last_price"] >= HEDGE_PRICE_THRESHOLD
+    ]
+    if not breaching:
+        return []
+
+    symbols = [p["tradingsymbol"] for p in breaching]
+
+    # Cancel any still-pending trim order from a previous call before placing a new
+    # one — this can be called repeatedly a minute apart, and an unfilled limit order
+    # from the last call plus a fresh one for the same excess would double-trim.
+    n_cancelled = _cancel_open_orders(kite, symbols)
+    if n_cancelled:
+        log.info("Cancelled %d pending trim order(s) before re-trimming.", n_cancelled)
+
+    exchange_symbols = [f"{p['exchange']}:{p['tradingsymbol']}" for p in breaching]
+    try:
+        ltp_data = kite.ltp(exchange_symbols)
+    except Exception as exc:
+        log.warning("LTP fetch failed for oversize trim, using last_price: %s", exc)
+        ltp_data = {}
+
+    lot_sizes = _get_lot_sizes(kite, symbols)
+
+    results = []
+    for pos in breaching:
+        symbol = pos["tradingsymbol"]
+        excess = pos["quantity"] - max_qty  # always positive — breaching is qty > max_qty (long only)
+        tx     = kite.TRANSACTION_TYPE_SELL
+
+        key = f"{pos['exchange']}:{symbol}"
+        ltp = ltp_data.get(key, {}).get("last_price", pos["last_price"])
+        buffer = max(1.0, round(ltp * 0.01, 1))
+        limit_price = round(ltp - buffer, 1)
+
+        lot_size  = lot_sizes.get(symbol, 1)
+        max_chunk = (FREEZE_QTY_LIMIT // lot_size) * lot_size if lot_size > 1 else FREEZE_QTY_LIMIT
+        remaining = excess
+        error = None
+
+        while remaining > 0:
+            chunk = min(remaining, max_chunk)
+            try:
+                order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=pos["exchange"],
+                    tradingsymbol=symbol,
+                    transaction_type=tx,
+                    quantity=chunk,
+                    product=pos["product"],
+                    order_type=kite.ORDER_TYPE_LIMIT,
+                    price=limit_price,
+                )
+                log.info("Oversize trim order: %s %s qty=%d @ %.1f order_id=%s", tx, symbol, chunk, limit_price, order_id)
+                remaining -= chunk
+            except Exception as exc:
+                log.error("Failed to trim excess for %s qty=%d: %s", symbol, chunk, exc)
+                error = str(exc)
+                break
+
+        results.append({"symbol": symbol, "excess": excess, "trimmed": excess - remaining, "error": error})
+
+    return results
+
+
 def _start_cooloff(tracker: "PositionTracker") -> datetime:
     """Arms the post-exit cool-off window; returns the IST timestamp it runs until."""
     until = datetime.now(IST) + timedelta(minutes=COOLOFF_MINUTES)
@@ -1869,7 +1951,12 @@ class PositionTracker:
 
         # Position size limit state
         self.oversize_since = {}        # symbol -> timestamp when it first exceeded MAX_POSITION_QTY
-        self.last_oversize_alert = 0.0  # timestamp of last oversize alert (60s cooldown)
+        self.last_oversize_alert = 0.0  # timestamp of last oversize alert/trim attempt (60s cooldown)
+        # Every open position except the weekly hedge (unlike self.positions, this
+        # INCLUDES strangle legs) — raw Kite dicts keyed by tradingsymbol, refreshed
+        # alongside self.positions. Feeds the oversize-position trim check below, which
+        # must see strangle legs since those are real bought/sold option quantity too.
+        self.non_hedge_positions = {}
 
         # Session P&L range, for the EOD summary / history
         self.session_peak_pnl = 0.0
@@ -1916,7 +2003,8 @@ class PositionTracker:
             with self.strangle_lock:
                 excluded = frozenset(self.strangle_symbols)
             with self.hedge_lock:
-                excluded |= frozenset(self.hedge_symbols)
+                hedge_excluded = frozenset(self.hedge_symbols)
+            excluded |= hedge_excluded
             with self.lock:
                 self.positions = {
                     p["instrument_token"]: p for p in net
@@ -1927,6 +2015,10 @@ class PositionTracker:
                     float(p.get("pnl", 0)) for p in net
                     if p["quantity"] == 0 and p["tradingsymbol"] not in excluded
                 )
+                self.non_hedge_positions = {
+                    p["tradingsymbol"]: p for p in net
+                    if p["quantity"] != 0 and p["tradingsymbol"] not in hedge_excluded
+                }
             log.info(f"Refreshed positions: {len(self.positions)} open, realized P&L: {self.realized_pnl:.2f}")
         except Exception as e:
             log.error(f"Failed to refresh positions: {e}")
@@ -2921,32 +3013,50 @@ def main():
                 log.info("EOD summary recorded: %s", record)
                 eod_summary_sent = True
 
-            # ---- Position size limit check ----
+            # ---- Position size limit check — auto-trims the excess ----
+            # Guards against accidentally BUYING too much of a non-hedge option — short/
+            # sold legs (the strangle included) are out of scope by design, hence qty >
+            # MAX_POSITION_QTY rather than abs(qty). Uses tracker.non_hedge_positions
+            # (every open position except the weekly hedge, refreshed every 2 min above)
+            # rather than `details`, since `details` comes from compute_pnl which
+            # excludes strangle legs too — this must still see a stray long position on
+            # a strangle-owned symbol if one ever showed up.
             breaching = [
-                d for d in details
-                if abs(d["qty"]) > MAX_POSITION_QTY and d["ltp"] >= HEDGE_PRICE_THRESHOLD
+                p for p in tracker.non_hedge_positions.values()
+                if p["quantity"] > MAX_POSITION_QTY and p["last_price"] >= HEDGE_PRICE_THRESHOLD
             ]
             # Track when each symbol first breached
-            breaching_symbols = {d["symbol"] for d in breaching}
-            for d in breaching:
-                if d["symbol"] not in tracker.oversize_since:
-                    tracker.oversize_since[d["symbol"]] = now
+            breaching_symbols = {p["tradingsymbol"] for p in breaching}
+            for p in breaching:
+                if p["tradingsymbol"] not in tracker.oversize_since:
+                    tracker.oversize_since[p["tradingsymbol"]] = now
             # Clear symbols that are no longer breaching
             for sym in list(tracker.oversize_since):
                 if sym not in breaching_symbols:
                     del tracker.oversize_since[sym]
-            # Alert every 60s while any position is breaching
+            # Trim the excess at most once every 60s while any position is breaching —
+            # gives a just-placed trim order time to fill before we re-check and re-trim.
             if breaching and now - tracker.last_oversize_alert >= 60:
                 tracker.last_oversize_alert = now
-                lines = []
-                for d in breaching:
-                    elapsed = int((now - tracker.oversize_since[d["symbol"]]) / 60)
-                    lines.append(f"{d['symbol']}: qty {abs(d['qty'])} — {elapsed} min exceeded")
-                notify(
-                    f"⚠️ Max lot size exceeded (limit: {MAX_POSITION_QTY})",
-                    "\n".join(lines),
-                    priority="high",
-                )
+                try:
+                    with tracker.hedge_lock:
+                        hedge_syms = frozenset(tracker.hedge_symbols)
+                    trimmed = trim_oversize_positions(kite, hedge_syms, MAX_POSITION_QTY)
+                    lines = []
+                    for r in trimmed:
+                        elapsed = int((now - tracker.oversize_since.get(r["symbol"], now)) / 60)
+                        if r["error"]:
+                            lines.append(f"{r['symbol']}: excess {r['excess']}, trim FAILED — {r['error']}")
+                        else:
+                            lines.append(f"{r['symbol']}: trimmed {r['trimmed']} back to {MAX_POSITION_QTY} — {elapsed} min exceeded")
+                    notify(
+                        f"⚠️ Max position qty exceeded (limit: {MAX_POSITION_QTY}) — trimming excess",
+                        "\n".join(lines),
+                        priority="high",
+                    )
+                except Exception as exc:
+                    log.error("Oversize position trim failed: %s", exc)
+                    notify("⚠️ Oversize position trim ERROR", str(exc), priority="urgent")
 
             # ---- Trailing profit-lock (the important one) ----
             event = tracker.update_trailing_stop(total_pnl)
