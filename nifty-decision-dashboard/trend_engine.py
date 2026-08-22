@@ -15,6 +15,15 @@ this exists to catch: ADX is still numerically high (so Trend Strength still
 reads STRONG) but has stopped rising and the DI spread is narrowing — that
 reads MATURING here, not STRENGTHENING, even though a naive "ADX is high"
 check would say the opposite.
+
+Opening-Range Breakout (ORB) fallback: for roughly the first hour of every
+session (see config.py's orb_fallback_minutes), the 5-vote system above has
+no usable data yet — most of its indicators need far more bar history than
+exists that early. Rather than sit on NEUTRAL/insufficient_data through an
+obvious early move, evaluate_trend() substitutes a breakout read off the
+opening range during this window (_evaluate_orb()) — see TrendReadMode /
+TrendResult.mode, which tells the caller (and the UI) which method actually
+produced a given read.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from candles import session_start
 from config import TrendEngineConfig
 from snapshot import IndicatorSnapshot, TimeframeIndicators
 
@@ -57,6 +67,11 @@ class VolatilityLevel(str, Enum):
     HIGH = "HIGH"
 
 
+class TrendReadMode(str, Enum):
+    STANDARD = "STANDARD"                            # the full 5-vote system
+    OPENING_RANGE_BREAKOUT = "OPENING_RANGE_BREAKOUT"  # early-session fallback — see module docstring
+
+
 @dataclass
 class TrendResult:
     direction: TrendDirection
@@ -65,9 +80,10 @@ class TrendResult:
     momentum: MomentumState
     volatility: VolatilityLevel
     adx_direction: Optional[str]   # "UP" | "DOWN" | "FLAT" | None (insufficient data)
-    votes: dict                    # {"aroon": -1|0|1, ...} — one entry per voting signal
+    votes: dict                    # {"aroon": -1|0|1, ...} — one entry per voting signal; empty in ORB mode
     reasons: list                  # human-readable one-liners, for Detailed Mode / event feed
     insufficient_data: bool = False
+    mode: TrendReadMode = TrendReadMode.STANDARD
 
 
 def _last_valid(series: list) -> Optional[float]:
@@ -235,9 +251,68 @@ def classify_volatility(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> Vola
     return VolatilityLevel.NORMAL
 
 
+def _elapsed_session_minutes(snapshot: IndicatorSnapshot) -> Optional[float]:
+    """Minutes from 09:15 IST to the latest 1-min candle — None if there's
+    no candle data at all yet."""
+    if not snapshot.candles_1m:
+        return None
+    last_date = snapshot.candles_1m[-1]["date"]
+    return (last_date - session_start(last_date)).total_seconds() / 60
+
+
+def _evaluate_orb(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig) -> Optional[TrendResult]:
+    """Opening-range breakout read — see module docstring. Returns None if
+    the opening range itself hasn't formed yet (the first
+    IndicatorConfig.opening_range_minutes of the session), in which case
+    evaluate_trend() falls through to the standard path, which will just
+    honestly read NEUTRAL/insufficient_data as it always has."""
+    orange = snapshot.opening_range
+    if orange is None or not snapshot.candles_1m:
+        return None
+    or_width = orange.high - orange.low
+    if or_width <= 0:
+        return None
+
+    price = snapshot.candles_1m[-1]["close"]
+    if price > orange.high:
+        sign, distance, edge_desc = 1, price - orange.high, f"above OR high ({orange.high:.1f})"
+    elif price < orange.low:
+        sign, distance, edge_desc = -1, orange.low - price, f"below OR low ({orange.low:.1f})"
+    else:
+        sign, distance, edge_desc = 0, 0.0, f"still inside the opening range ({orange.low:.1f}-{orange.high:.1f})"
+
+    ratio = distance / or_width
+    if sign == 0 or ratio <= cfg.orb_weak_ratio:
+        score = 0
+    elif ratio < cfg.orb_moderate_ratio:
+        score = sign * 1
+    elif ratio < cfg.orb_strong_ratio:
+        score = sign * 3
+    else:
+        score = sign * 5
+    direction = _direction_from_score(score, cfg)
+
+    reason = (f"Opening range breakout: price {distance:.1f} pts {edge_desc} "
+              f"(range width {or_width:.1f} pts) -> {direction.value}")
+    return TrendResult(
+        direction=direction, score=score, strength=TrendStrength.WEAK,
+        momentum=MomentumState.STABLE, volatility=VolatilityLevel.NORMAL, adx_direction=None,
+        votes={}, reasons=[reason, "Standard trend read not yet available this early in the session "
+                                    "(indicators still warming up) — using opening-range breakout instead."],
+        insufficient_data=True, mode=TrendReadMode.OPENING_RANGE_BREAKOUT,
+    )
+
+
 def evaluate_trend(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig = None) -> TrendResult:
     cfg = cfg or TrendEngineConfig()
     tf = snapshot.tf5
+
+    elapsed = _elapsed_session_minutes(snapshot)
+    if elapsed is not None and elapsed < cfg.orb_fallback_minutes:
+        orb_result = _evaluate_orb(snapshot, cfg)
+        if orb_result is not None:
+            return orb_result
+        # Opening range itself hasn't formed yet — fall through below.
 
     votes = {}
     reasons = []

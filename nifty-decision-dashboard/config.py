@@ -99,6 +99,25 @@ class TrendEngineConfig:
     volatility_expansion_ratio: float = 1.25
     volatility_contraction_ratio: float = 0.80
 
+    # Opening-Range Breakout fallback: the standard 5-vote system needs
+    # ~70+ minutes of 5-min-bar history before ANY vote can compute at all
+    # (Aroon/DMI need aroon_period/dmi_period bars; EMA structure needs
+    # EMA50, far longer still) — for roughly the first hour of every
+    # session it would otherwise read NEUTRAL/insufficient_data throughout,
+    # even against an obvious early move. During this window,
+    # direction/score are instead derived from a simple opening-range
+    # breakout read: how far price has moved past the OR's own high/low,
+    # in units of the OR's own width (see trend_engine.py's
+    # _evaluate_orb()). Momentum/Volatility/ADX-direction are NOT
+    # substituted — they stay honestly "insufficient data" during this
+    # window, since ORB has no equivalent read for those. Assumes
+    # orb_fallback_minutes > IndicatorConfig.opening_range_minutes (the OR
+    # itself must have already formed) — true for the defaults (60 > 15).
+    orb_fallback_minutes: int = 60
+    orb_weak_ratio: float = 0.0      # any close beyond OR high/low at all -> at least WEAK
+    orb_moderate_ratio: float = 0.5   # beyond by 50% of the OR's own width -> BULL/BEAR
+    orb_strong_ratio: float = 1.0     # beyond by a full OR-width -> STRONG_BULL/STRONG_BEAR
+
 
 @dataclass
 class EntryEngineConfig:

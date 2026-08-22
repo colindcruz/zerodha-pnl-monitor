@@ -73,19 +73,28 @@
 
     // ---- hero: market state ----
     const t = data.trend || {};
+    const isORB = t.mode === "OPENING_RANGE_BREAKOUT";
     el("market-state-icon").textContent = TREND_ICONS[t.direction] || "➖";
     const msv = el("market-state-value");
     msv.textContent = (t.direction || "—").replaceAll("_", " ");
     msv.className = "hero-value " + toneClass("trend", t.direction);
-    el("market-state-sub").textContent = MOMENTUM_SUBTITLE[t.momentum] || "—";
+    el("market-state-sub").textContent = isORB
+      ? "Opening-range breakout read (early session — standard trend not ready yet)"
+      : (MOMENTUM_SUBTITLE[t.momentum] || "—");
 
     // ---- hero: trend score + vote bars ----
     const tsv = el("trend-score-value");
     tsv.textContent = t.score != null ? (t.score >= 0 ? "+" : "") + t.score + " / 5" : "—";
     tsv.className = "hero-value " + toneClass("trend", t.direction);
-    el("trend-score-sub").textContent = t.score != null ? SCORE_SUBTITLE(Math.abs(t.score)) : "—";
+    el("trend-score-sub").textContent = isORB
+      ? "ORB mode"
+      : (t.score != null ? SCORE_SUBTITLE(Math.abs(t.score)) : "—");
     const votesEl = el("vote-bars");
     votesEl.innerHTML = "";
+    if (isORB) {
+      votesEl.innerHTML = '<div style="font-size:10px; color:var(--warn);">Standard 5-vote system not yet available — using opening-range breakout for the first '
+        + '~hour of the session.</div>';
+    }
     const VOTE_LABELS = { aroon: "Aroon", ema_structure: "EMA", vwap: "VWAP", dmi: "DMI", price_structure: "Structure" };
     Object.entries(t.votes || {}).forEach(([key, val]) => {
       const row = document.createElement("div");
