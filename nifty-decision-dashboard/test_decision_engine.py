@@ -16,7 +16,7 @@ from config import DecisionEngineConfig
 from decision_engine import EntryPermission, evaluate_decision
 from entry_engine import EntryResult, EntrySetupLabel
 from location_engine import ExtensionLevel, LocationResult, RunwayLevel
-from trend_engine import MomentumState, TrendDirection, TrendResult, TrendStrength
+from trend_engine import MomentumState, TrendDirection, TrendResult, TrendStrength, VolatilityLevel
 
 failures = []
 
@@ -30,7 +30,8 @@ def check(label: str, condition: bool, detail: str = ""):
 
 def mk_trend(direction, score):
     return TrendResult(direction=direction, score=score, strength=TrendStrength.STRONG,
-                        momentum=MomentumState.STABLE, votes={}, reasons=[])
+                        momentum=MomentumState.STABLE, volatility=VolatilityLevel.NORMAL,
+                        adx_direction="FLAT", votes={}, reasons=[])
 
 
 def mk_entry(direction, score):

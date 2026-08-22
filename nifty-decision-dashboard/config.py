@@ -85,6 +85,20 @@ class TrendEngineConfig:
     momentum_lookback_bars: int = 3
     momentum_flat_epsilon: float = 0.5  # |delta| below this counts as "flat", not rising/falling
 
+    # Volatility: ATR now vs ATR `volatility_lookback_bars` bars ago, as a
+    # ratio — expanding fast enough counts as HIGH, contracting enough as
+    # LOW, otherwise NORMAL. An independent read from Extension (which is
+    # about DISTANCE traveled, not the RATE candles are widening/narrowing).
+    # lookback_bars=5 (not fewer): ATR is Wilder-smoothed over atr_period,
+    # so after only 3 smoothing steps the ratio's floor as the new true
+    # range shrinks toward zero asymptotes to (1 - 1/atr_period)^3 ≈ 0.80 —
+    # i.e. LOW would be almost mathematically unreachable at 3 bars given
+    # the 0.80 contraction threshold below. 5 steps pushes that floor to
+    # ≈0.69, comfortably below 0.80 for a genuinely sharp contraction.
+    volatility_lookback_bars: int = 5
+    volatility_expansion_ratio: float = 1.25
+    volatility_contraction_ratio: float = 0.80
+
 
 @dataclass
 class EntryEngineConfig:

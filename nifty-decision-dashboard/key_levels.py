@@ -54,6 +54,12 @@ def compute_key_levels(snapshot: IndicatorSnapshot, prev_day: Optional[PrevDayOH
         add("Prev Day High", prev_day.high)
         add("Prev Day Low", prev_day.low)
         add("Prev Day Close", prev_day.close)
+        # Classic floor-trader pivots (from prev-day OHLC — the standard
+        # convention; no "close" of today exists yet to compute today's own).
+        pivot = (prev_day.high + prev_day.low + prev_day.close) / 3.0
+        add("Pivot (P)", pivot)
+        add("R1", 2 * pivot - prev_day.low)
+        add("S1", 2 * pivot - prev_day.high)
 
     if snapshot.opening_range is not None:
         add("Opening Range High", snapshot.opening_range.high)

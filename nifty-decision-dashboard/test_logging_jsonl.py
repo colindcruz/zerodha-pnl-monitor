@@ -14,7 +14,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from logging_jsonl import TrackedTrade, log_tick, log_trade_event, update_excursion
-from trend_engine import MomentumState, TrendDirection, TrendResult, TrendStrength
+from trend_engine import MomentumState, TrendDirection, TrendResult, TrendStrength, VolatilityLevel
 
 failures = []
 
@@ -35,7 +35,8 @@ print("=== log_tick round-trip ===")
 with tempfile.TemporaryDirectory() as d:
     path = Path(d) / "tick_log.jsonl"
     trend = TrendResult(direction=TrendDirection.STRONG_BULL, score=5, strength=TrendStrength.STRONG,
-                         momentum=MomentumState.STABLE, votes={"aroon": 1}, reasons=["Aroon: bullish"])
+                         momentum=MomentumState.STABLE, volatility=VolatilityLevel.NORMAL,
+                         adx_direction="UP", votes={"aroon": 1}, reasons=["Aroon: bullish"])
     log_tick(path, T0, tick_seq=1, spot=24000.5, trend=trend, positions=[{"tradingsymbol": "NIFTY26AUG25000CE"}])
 
     lines = path.read_text().strip().split("\n")

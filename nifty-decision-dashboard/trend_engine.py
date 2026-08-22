@@ -51,12 +51,20 @@ class MomentumState(str, Enum):
     DETERIORATING = "DETERIORATING"
 
 
+class VolatilityLevel(str, Enum):
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+
+
 @dataclass
 class TrendResult:
     direction: TrendDirection
     score: int                     # -5..+5
     strength: TrendStrength
     momentum: MomentumState
+    volatility: VolatilityLevel
+    adx_direction: Optional[str]   # "UP" | "DOWN" | "FLAT" | None (insufficient data)
     votes: dict                    # {"aroon": -1|0|1, ...} — one entry per voting signal
     reasons: list                  # human-readable one-liners, for Detailed Mode / event feed
     insufficient_data: bool = False
@@ -179,29 +187,52 @@ def _momentum_state(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> tuple[Mo
     pdi_series = tf.dmi_adx.plus_di
     mdi_series = tf.dmi_adx.minus_di
     if len(adx_series) <= lookback:
-        return MomentumState.STABLE, True
+        return MomentumState.STABLE, True, None
 
     adx_now, adx_before = adx_series[-1], adx_series[-1 - lookback]
     pdi_now, mdi_now = pdi_series[-1], mdi_series[-1]
     pdi_before, mdi_before = pdi_series[-1 - lookback], mdi_series[-1 - lookback]
     if None in (adx_now, adx_before, pdi_now, mdi_now, pdi_before, mdi_before):
-        return MomentumState.STABLE, True
+        return MomentumState.STABLE, True, None
 
     adx_delta = adx_now - adx_before
     spread_now = abs(pdi_now - mdi_now)
     spread_before = abs(pdi_before - mdi_before)
     spread_delta = spread_now - spread_before
     eps = cfg.momentum_flat_epsilon
+    adx_direction = "UP" if adx_delta > eps else "DOWN" if adx_delta < -eps else "FLAT"
 
     if adx_delta > eps and spread_delta > eps:
-        return MomentumState.STRENGTHENING, False
+        return MomentumState.STRENGTHENING, False, adx_direction
     if adx_delta < -eps and spread_delta < -eps:
-        return MomentumState.DETERIORATING, False
+        return MomentumState.DETERIORATING, False, adx_direction
     if adx_delta <= eps and spread_delta < -eps:
         # ADX not clearly still rising, but directional conviction (DI spread)
         # is already narrowing — high-but-fading, not accelerating.
-        return MomentumState.MATURING, False
-    return MomentumState.STABLE, False
+        return MomentumState.MATURING, False, adx_direction
+    return MomentumState.STABLE, False, adx_direction
+
+
+def classify_volatility(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> VolatilityLevel:
+    """ATR now vs ATR `volatility_lookback_bars` bars ago, as a ratio — an
+    independent read from Extension (location_engine.py), which measures
+    DISTANCE traveled from VWAP/EMA20, not the RATE candles are widening or
+    narrowing. Defaults to NORMAL on insufficient data (a volatility read
+    nobody can support yet shouldn't itself read as alarmingly HIGH or
+    suspiciously LOW)."""
+    lookback = cfg.volatility_lookback_bars
+    series = tf.atr
+    if len(series) <= lookback:
+        return VolatilityLevel.NORMAL
+    now, before = series[-1], series[-1 - lookback]
+    if now is None or before is None or before == 0:
+        return VolatilityLevel.NORMAL
+    ratio = now / before
+    if ratio >= cfg.volatility_expansion_ratio:
+        return VolatilityLevel.HIGH
+    if ratio <= cfg.volatility_contraction_ratio:
+        return VolatilityLevel.LOW
+    return VolatilityLevel.NORMAL
 
 
 def evaluate_trend(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig = None) -> TrendResult:
@@ -224,9 +255,11 @@ def evaluate_trend(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig = None) -
     score = sum(votes.values())
     direction = _direction_from_score(score, cfg)
     strength = _trend_strength(_last_valid(tf.dmi_adx.adx), cfg)
-    momentum, insufficient = _momentum_state(tf, cfg)
+    momentum, insufficient, adx_direction = _momentum_state(tf, cfg)
+    volatility = classify_volatility(tf, cfg)
 
     return TrendResult(
         direction=direction, score=score, strength=strength, momentum=momentum,
+        volatility=volatility, adx_direction=adx_direction,
         votes=votes, reasons=reasons, insufficient_data=insufficient,
     )

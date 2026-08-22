@@ -61,7 +61,20 @@ check("prev day high/low/close all present", {"Prev Day High", "Prev Day Low", "
 pdh = next(lv for lv in result2.levels if lv.name == "Prev Day High")
 check("prev day high distance == 100", pdh.distance_points == 100, str(pdh.distance_points))
 
+# Classic floor-trader pivots: P = (H+L+C)/3, R1 = 2P-L, S1 = 2P-H.
+# H=24100, L=23900, C=24050 -> P = 72050/3 = 24016.667, R1 = 24133.333, S1 = 23933.333.
+pivot_names = {"Pivot (P)", "R1", "S1"}
+check("pivot levels present", pivot_names <= names, str(names))
+pivot_level = next(lv for lv in result2.levels if lv.name == "Pivot (P)")
+r1_level = next(lv for lv in result2.levels if lv.name == "R1")
+s1_level = next(lv for lv in result2.levels if lv.name == "S1")
+check("pivot price hand-computed", abs(pivot_level.price - 24016.6667) < 0.001, str(pivot_level.price))
+check("R1 hand-computed (2P - L)", abs(r1_level.price - 24133.3333) < 0.001, str(r1_level.price))
+check("S1 hand-computed (2P - H)", abs(s1_level.price - 23933.3333) < 0.001, str(s1_level.price))
+check("R1 above pivot above S1", r1_level.price > pivot_level.price > s1_level.price)
+
 result_no_prev = compute_key_levels(snap, None)
+check("no prev-day data -> no pivot levels either", not any(lv.name in pivot_names for lv in result_no_prev.levels))
 check("no prev-day data -> no prev-day levels",
       not any("Prev Day" in lv.name for lv in result_no_prev.levels))
 

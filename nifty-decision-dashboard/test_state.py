@@ -66,7 +66,9 @@ no_positions = []
 with_position = [{"exchange": "NFO", "tradingsymbol": "NIFTY26AUG25000CE", "quantity": 50,
                    "average_price": 100.0, "last_price": 110.0}]
 
-positions_sequence = [no_positions, no_positions, with_position, with_position, no_positions]
+# 6 entries for 6 total recompute() calls in this test: tick1, tick2, tick3,
+# the bar-close tick inserted between tick3 and tick4, tick4, tick5.
+positions_sequence = [no_positions, no_positions, with_position, with_position, with_position, no_positions]
 
 with tempfile.TemporaryDirectory() as d:
     tick_log = Path(d) / "tick.jsonl"
@@ -108,6 +110,8 @@ with tempfile.TemporaryDirectory() as d:
     # ============================================================
     result2 = state.recompute(now + timedelta(minutes=1))
     check("tick_seq increments", result2["tick_seq"] == 2, str(result2["tick_seq"]))
+    check("event feed still quiet (identical candle data, no new bar, no position)",
+          state.event_feed.events == [], str(state.event_feed.events))
 
     # ============================================================
     print("\n=== recompute tick 3: a NIFTY position appears -> ENTRY_DETECTED ===")
@@ -118,8 +122,21 @@ with tempfile.TemporaryDirectory() as d:
           result3["positions"][0]["owner"] == "manual", str(result3["positions"][0]))
     check("a PositionHealthEngine now exists for the symbol",
           "NIFTY26AUG25000CE" in state.position_engines)
-    check("position_health present in the returned state",
-          "NIFTY26AUG25000CE" in result3["position_health"], str(result3["position_health"].keys()))
+    # Position Management is bar-gated (see state.py's module docstring): no
+    # NEW 5-min bar has closed since backfill, so its health isn't assessed
+    # THIS tick — that's correct, not a gap. Confirmed once a genuinely new
+    # bar closes, just below.
+    check("position_health NOT yet populated this tick (no new 5-min bar has closed)",
+          "NIFTY26AUG25000CE" not in result3["position_health"], str(result3["position_health"].keys()))
+
+    bar_close_time = one_min[-1]["date"] + timedelta(minutes=5)
+    state.on_tick(bar_close_time, one_min[-1]["close"])
+    result3b = state.recompute(bar_close_time)
+    check("position_health populated once a new 5-min bar actually closes",
+          "NIFTY26AUG25000CE" in result3b["position_health"], str(result3b["position_health"].keys()))
+    check("trend_age_bars advances on a new bar", result3b["trend_age_bars"] >= 1, str(result3b["trend_age_bars"]))
+    check("vote_persistence populated once a bar has closed", bool(result3b["vote_persistence"]),
+          str(result3b["vote_persistence"]))
 
     trade_lines = trade_log.read_text().strip().split("\n") if trade_log.exists() else []
     check("ENTRY_DETECTED logged to the trade log", len(trade_lines) == 1, str(trade_lines))
@@ -135,6 +152,7 @@ with tempfile.TemporaryDirectory() as d:
     trade_lines_after_tick4 = trade_log.read_text().strip().split("\n")
     check("still only 1 trade-log line (no duplicate entry event)", len(trade_lines_after_tick4) == 1,
           str(trade_lines_after_tick4))
+    events_before_tick5 = len(state.event_feed.events)
 
     # ============================================================
     print("\n=== recompute tick 5: position disappears -> EXIT_DETECTED ===")
@@ -146,26 +164,14 @@ with tempfile.TemporaryDirectory() as d:
         exit_rec = json.loads(trade_lines_final[1])
         check("exit event type correct", exit_rec["event"] == "EXIT_DETECTED", str(exit_rec))
     check("engine/tracked-trade cleaned up after exit", "NIFTY26AUG25000CE" not in state.position_engines)
+    check("a position disappearing alone fires no NEW event-feed transition (that's the trade log's job)",
+          len(state.event_feed.events) == events_before_tick5, str(state.event_feed.events[events_before_tick5:]))
 
     # ============================================================
-    print("\n=== event feed stays quiet when nothing actually changed ===")
+    print("\n=== tick log has one line per recompute call (6 total) ===")
     # ============================================================
-    # This scripted run holds a steady uptrend throughout every recompute
-    # call (backfill loads the full session once; ticks only move the
-    # clock, not the underlying candles), so trend/strength/momentum never
-    # transition — the event feed must correctly emit ZERO events across
-    # all 5 ticks rather than firing on every recompute just because it was
-    # called. (A position appearing/disappearing is intentionally NOT an
-    # event-feed transition either, by events.py's own design — see
-    # test_events.py's "no event on the first tick"; that's the trade log's
-    # job, already verified above via ENTRY/EXIT_DETECTED.)
-    check("event feed emitted zero events across 5 ticks of genuinely unchanged classifications",
-          state.event_feed.events == [], str(state.event_feed.events))
-
-    # ============================================================
-    print("\n=== tick log has one line per recompute call (5 total) ===")
-    # ============================================================
-    check("tick log has 5 lines", len(tick_log.read_text().strip().split("\n")) == 5,
+    # tick1, tick2, tick3, the bar-close tick between tick3/tick4, tick4, tick5.
+    check("tick log has 6 lines", len(tick_log.read_text().strip().split("\n")) == 6,
           str(len(tick_log.read_text().strip().split("\n"))))
 
 
