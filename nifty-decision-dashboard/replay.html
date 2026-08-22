@@ -1,5 +1,5 @@
 <!doctype html>
-<title>NIFTY Decision Dashboard</title>
+<title>NIFTY Decision Dashboard — Replay</title>
 <style>
   :root {
     color-scheme: dark;
@@ -162,6 +162,18 @@
   .stack { display: flex; flex-direction: column; gap: 12px; }
 
   .footnote { font-size: 10.5px; color: var(--text-muted); line-height: 1.6; padding: 2px 4px; }
+
+  .replay-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .replay-select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text-primary); font-family: inherit; font-size: 11px; padding: 6px 8px; }
+  .replay-btn { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text-primary); font-family: inherit; font-size: 11px; font-weight: 700; padding: 6px 12px;
+    cursor: pointer; }
+  .replay-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .replay-btn:disabled { opacity: 0.35; cursor: default; }
+  .replay-live-link { font-size: 10px; color: var(--text-muted); text-decoration: none; border: 1px solid var(--border);
+    border-radius: 999px; padding: 5px 10px; }
+  .replay-live-link:hover { color: var(--accent); border-color: var(--accent); }
 </style>
 
 <div class="wrap">
@@ -173,20 +185,22 @@
         <div class="sub">Advisory only &middot; no orders placed</div>
       </div>
     </div>
-    <div class="header-right">
+    <div class="header-right replay-controls">
       <div class="hstat">
-        <div class="k">Market Status</div>
-        <div class="v" id="market-status"><span class="dot off"></span>—</div>
+        <div class="k">Session</div>
+        <select class="replay-select" id="replay-date"></select>
       </div>
       <div class="hstat">
-        <div class="k">Time</div>
-        <div class="v" id="clock-time">—</div>
+        <div class="k">Bar</div>
+        <div class="v" id="bar-index">— / —</div>
       </div>
       <div class="hstat">
-        <div class="k">Date</div>
-        <div class="v" id="clock-date">—</div>
+        <div class="k">Bar Time (IST)</div>
+        <div class="v" id="bar-time">—</div>
       </div>
-      <span class="conn-badge" id="conn-status">Connecting…</span>
+      <button class="replay-btn" id="btn-prev">&#9664; Prev</button>
+      <button class="replay-btn" id="btn-next">Next &#9654;</button>
+      <a class="replay-live-link" href="/">Live Dashboard &#8594;</a>
     </div>
   </div>
 
@@ -290,61 +304,79 @@
   "use strict";
 
   // ---------------------------------------------------------------
-  // Header clock / market-open banner (client-side, IST, approximate —
-  // weekday 09:15-15:40 window, no holiday calendar, same limitation
-  // live-dashboard's own banner already accepts). Page-specific to the
-  // LIVE dashboard — replay.html has no real-time clock, its header shows
-  // the replayed bar's own timestamp instead.
+  // Manual step-through of a prebuilt historical replay array (see
+  // replay_build.py) — one entry per 5-min bar, starting at 09:15 IST.
+  // No WebSocket, no live Kite session here at all; this page only ever
+  // talks to /api/replay-dates and /api/replay/{date}.
   // ---------------------------------------------------------------
-  function updateClock() {
-    const now = new Date();
-    const ist = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-    el("clock-time").textContent = ist.toLocaleTimeString("en-IN", { hour12: false });
-    el("clock-date").textContent = ist.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
-    const dow = ist.getDay();
-    const minutesOfDay = ist.getHours() * 60 + ist.getMinutes();
-    const open = dow >= 1 && dow <= 5 && minutesOfDay >= 9 * 60 + 15 && minutesOfDay <= 15 * 60 + 40;
-    const statusEl = el("market-status");
-    statusEl.innerHTML = `<span class="dot ${open ? "on" : "off"}"></span>${open ? "OPEN" : "CLOSED"}`;
-    statusEl.className = "v " + (open ? "market-open" : "market-closed");
-  }
-  setInterval(updateClock, 1000);
-  updateClock();
+  let bars = [];
+  let index = 0;
 
-  // ---------------------------------------------------------------
-  // WebSocket — full state on every recompute tick, auto-reconnect.
-  // ---------------------------------------------------------------
-  let ws = null;
-  let reconnectAttempt = 0;
-  let reconnectTimer = null;
+  const dateSelect = el("replay-date");
+  const btnPrev = el("btn-prev");
+  const btnNext = el("btn-next");
 
-  function wsUrl() {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${location.host}/ws`;
-  }
-  function setConnStatus(state) {
-    const badge = el("conn-status");
-    badge.className = "conn-badge " + state;
-    badge.textContent = state === "live" ? "Live" : state === "reconnecting" ? "Reconnecting…" : "Connecting…";
-  }
-  function connectWS() {
-    ws = new WebSocket(wsUrl());
-    ws.onopen = () => { reconnectAttempt = 0; setConnStatus("live"); };
-    ws.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === "state" && msg.data) render(msg.data);
-    };
-    ws.onclose = () => { setConnStatus("reconnecting"); scheduleReconnect(); };
-    ws.onerror = () => { try { ws.close(); } catch (e) {} };
-  }
-  function scheduleReconnect() {
-    clearTimeout(reconnectTimer);
-    const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempt++));
-    reconnectTimer = setTimeout(connectWS, delay);
+  function updateNavButtons() {
+    btnPrev.disabled = index <= 0;
+    btnNext.disabled = index >= bars.length - 1;
+    el("bar-index").textContent = bars.length ? `${index + 1} / ${bars.length}` : "— / —";
+    el("bar-time").textContent = bars.length ? fmtTime(bars[index].ts).slice(0, 5) : "—";
   }
 
-  fetch("/api/state").then((r) => r.json()).then(render).catch(() => {});
-  connectWS();
+  function showBar(i) {
+    if (!bars.length) return;
+    index = Math.max(0, Math.min(bars.length - 1, i));
+    render(bars[index]);
+    updateNavButtons();
+  }
+
+  btnPrev.addEventListener("click", () => showBar(index - 1));
+  btnNext.addEventListener("click", () => showBar(index + 1));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") showBar(index - 1);
+    if (e.key === "ArrowRight") showBar(index + 1);
+  });
+
+  async function loadDate(date) {
+    try {
+      const res = await fetch(`/api/replay/${date}`);
+      if (!res.ok) throw new Error(`replay fetch failed: ${res.status}`);
+      bars = await res.json();
+      showBar(0);
+    } catch (e) {
+      console.error("failed to load replay data", e);
+      bars = [];
+      updateNavButtons();
+    }
+  }
+
+  dateSelect.addEventListener("change", () => loadDate(dateSelect.value));
+
+  async function init() {
+    try {
+      const res = await fetch("/api/replay-dates");
+      const data = await res.json();
+      const dates = data.dates || [];
+      dateSelect.innerHTML = "";
+      if (!dates.length) {
+        const opt = document.createElement("option");
+        opt.textContent = "No replays built yet";
+        dateSelect.appendChild(opt);
+        return;
+      }
+      dates.forEach((d) => {
+        const opt = document.createElement("option");
+        opt.value = d;
+        opt.textContent = d;
+        dateSelect.appendChild(opt);
+      });
+      dateSelect.value = dates[dates.length - 1];
+      await loadDate(dateSelect.value);
+    } catch (e) {
+      console.error("failed to load replay dates", e);
+    }
+  }
+
+  init();
 })();
 </script>

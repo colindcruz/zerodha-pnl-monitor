@@ -677,16 +677,17 @@ equivalents) while you're at it.
 
 ### 12.4 Using it
 
-- **Trading Mode** (default) shows the Entry Permission verdict (ENTER /
-  WAIT_FOR_PULLBACK / NO_TRADE) with its candidate direction and the reasons behind it,
-  Trend/Entry/Extension/Runway at a glance, the key-levels panel, every NIFTY-related
-  position in the account with its Position Management health state, and a "what
-  changed" feed of only the moments something actually transitioned.
-- **Detailed Mode** (toggle, top right) additionally shows every engine's raw votes/
-  component scores/reasons — useful for understanding *why* a verdict fired, or for
-  spotting a TWAP-fallback flag on VWAP (shown when the underlying session has no real
-  traded volume — NIFTY 50 is an index, not a traded instrument, so this is worth
-  watching on your first live session).
+- The main page (`/`) is one dense trading-terminal-style view (not a Trading/Detailed
+  toggle — an earlier iteration had that, since replaced): hero cards for Market State,
+  Trend Score (with per-vote bars), Trading Decision, and Entry Score (with its 5-point
+  checklist); detail panels for the Trend Engine, Location & Extension, Position
+  Management (a static 5-state ladder with the position's current state highlighted),
+  and Key Levels (VWAP, pivots, prev-day, opening range, nearest S/R); an Open Position
+  card (with T1/T2/stop detail for long-option-owned positions); Trend Summary,
+  Intraday Bias, Latest Signal, Upcoming Levels, and an Alerts feed.
+- A TWAP-fallback flag appears next to Key Levels when the underlying session has no
+  real traded volume — NIFTY 50 is an index, not a traded instrument, so this is worth
+  watching on your first live session.
 - The connection badge reads **Live** / **Reconnecting…**, same auto-reconnect-with-
   backoff behavior as `live-dashboard/`.
 - **The Position panel intentionally tracks every NIFTY position in the account**,
@@ -694,6 +695,32 @@ equivalents) while you're at it.
   long-option engine — its health verdict for those may disagree with what the owning
   system is actually doing about them. That's expected, not a bug: this engine's
   trend-failure logic doesn't know about those systems' own separate management rules.
+
+### 12.4.1 Historical replay (`/replay`)
+
+A separate page for stepping through a real past trading day bar-by-bar, at your own
+pace — useful for reviewing how the engines would have called a session without
+waiting for a live one.
+
+- **Building a replay**: on the droplet, `sudo -u pnlmon venv/bin/python replay_build.py
+  [YYYY-MM-DD]` (date optional — defaults to the most recent trading day). This fetches
+  that day's real 1-min NIFTY candles via the same Kite session, feeds them through the
+  exact same engine pipeline `server.py` uses live, and writes one snapshot per 5-min
+  bar (starting 09:15 IST) to `replay_data/<date>.json`. Read-only against Kite; touches
+  nothing live (its own log files land under `replay_data/_logs/`, separate from the
+  live service's).
+- **Positions are always empty in a replay** — Kite's `positions()` API has no
+  historical/point-in-time view, so the Position Management and Open Position panels
+  are blank throughout every replay by design; this is a Trend/Entry/Location/Decision
+  review tool, not a position-history tool.
+- **Using the page**: open `/replay`, pick a date from the dropdown (only dates you've
+  built appear), then step with the **Prev / Next** buttons or the **◀ / ▶** arrow
+  keys — each step is one real 5-min bar, matching the Trend and Position Management
+  engines' own bar cadence. The header shows which bar you're on and its IST timestamp.
+- `dashboard.html` and `replay.html` share one rendering file
+  (`dashboard_render.js`) so the live and replay views can never drift apart visually —
+  only their data source differs (a live WebSocket vs. a prebuilt array you step
+  through manually).
 
 ### 12.5 Explicitly out of scope (Phase 1)
 

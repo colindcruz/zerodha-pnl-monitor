@@ -174,6 +174,27 @@ with tempfile.TemporaryDirectory() as d:
     check("tick log has 6 lines", len(tick_log.read_text().strip().split("\n")) == 6,
           str(len(tick_log.read_text().strip().split("\n"))))
 
+    # ============================================================
+    print("\n=== self.latest stays JSON-serializable once a real event fires ===")
+    # ============================================================
+    # Regression test: Event.timestamp is a raw datetime; a naive asdict()
+    # (as opposed to state.py's _event_asdict()) leaves it as one, which
+    # server.py's plain json.dumps(dashboard_state.latest) in
+    # broadcast_state()/handle_ws() would then raise TypeError on — but
+    # only once a REAL transition actually fires, which this scripted run
+    # otherwise never triggers (steady, unchanging data throughout). Forcing
+    # one directly here is what catches it.
+    state.event_feed.update(now, trend_direction="BULL")
+    state.event_feed.update(now + timedelta(minutes=1), trend_direction="STRONG_BULL")
+    state.recompute(now + timedelta(minutes=5))
+    check("events list is non-empty after forcing a real transition", len(state.latest["events"]) > 0,
+          str(state.latest["events"]))
+    try:
+        json.dumps(state.latest)
+        check("json.dumps(state.latest) succeeds with a real event present", True)
+    except TypeError as exc:
+        check("json.dumps(state.latest) succeeds with a real event present", False, str(exc))
+
 
 # ============================================================
 print("\n" + "=" * 60)

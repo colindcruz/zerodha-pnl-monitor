@@ -55,6 +55,16 @@ _BEARISH = {TrendDirection.STRONG_BEAR, TrendDirection.BEAR, TrendDirection.WEAK
 VOTE_PERSISTENCE_WINDOW = 5  # bars — "Persistence: N/5" in the UI
 
 
+def _event_asdict(event) -> dict:
+    """Event.timestamp is a raw datetime — dataclasses.asdict() leaves it as
+    one, not a JSON-safe string (unlike log_tick's use of asdict() on the
+    engine results, which never carry a bare datetime field). Every place
+    an Event ends up in self.latest must go through this, not a plain
+    asdict(), or json.dumps() in server.py's broadcast_state()/handle_ws()
+    raises TypeError the moment a real event actually fires."""
+    return {**asdict(event), "timestamp": event.timestamp.isoformat()}
+
+
 def _trend_sign(direction: TrendDirection) -> int:
     if direction in _BULLISH:
         return 1
@@ -348,8 +358,8 @@ class DashboardState:
             "vwap_is_twap_fallback": vwap_is_twap,
             "positions": labeled_positions,
             "position_health": {s: asdict(r) for s, r in position_health.items()},
-            "events": [asdict(e) for e in recent_events],
-            "latest_signal": asdict(recent_events[-1]) if recent_events else None,
+            "events": [_event_asdict(e) for e in recent_events],
+            "latest_signal": _event_asdict(recent_events[-1]) if recent_events else None,
             "trend_age_bars": self._trend_age_bars,
             "trend_detail": self._trend_detail(snapshot),
             "vote_persistence": self._vote_persistence(),

@@ -8,6 +8,7 @@ long_option_state.json
 long_option_engine.log
 nifty_decision_tick_log.jsonl
 nifty_decision_trade_log.jsonl
+nifty-decision-dashboard/replay_data/
 __pycache__/
 *.pyc
 venv/

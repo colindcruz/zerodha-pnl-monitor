@@ -34,6 +34,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -72,6 +73,13 @@ LONG_OPTION_STATE_FILE = Path(os.getenv("LONG_OPTION_STATE_FILE", "../long_optio
 TICK_LOG_FILE = Path(os.getenv("TICK_LOG_FILE", "nifty_decision_tick_log.jsonl"))
 TRADE_LOG_FILE = Path(os.getenv("TRADE_LOG_FILE", "nifty_decision_trade_log.jsonl"))
 
+# Prebuilt historical-replay snapshots (see replay_build.py) — one JSON file
+# per date, each an array of state-payload dicts (same shape as
+# DashboardState.latest), one entry per 5-min bar. Built offline/on-demand,
+# never written by server.py itself.
+REPLAY_DATA_DIR = Path(os.getenv("REPLAY_DATA_DIR", "replay_data"))
+_REPLAY_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 IST = ZoneInfo("Asia/Kolkata")
 COOKIE_NAME = "decision_dashboard_session"
 SESSION_MAX_AGE_SECONDS = 30 * 86400  # 30 days
@@ -79,6 +87,8 @@ SESSION_MAX_AGE_SECONDS = 30 * 86400  # 30 days
 HERE = Path(__file__).parent
 DASHBOARD_HTML = (HERE / "dashboard.html").read_text(encoding="utf-8")
 LOGIN_HTML = (HERE / "login.html").read_text(encoding="utf-8")
+REPLAY_HTML = (HERE / "replay.html").read_text(encoding="utf-8")
+DASHBOARD_RENDER_JS = (HERE / "dashboard_render.js").read_text(encoding="utf-8")
 
 
 def _read_access_token() -> str:
@@ -160,6 +170,33 @@ async def get_dashboard(request: web.Request) -> web.Response:
 
 async def handle_state(request: web.Request) -> web.Response:
     return web.json_response(dashboard_state.latest or {"status": "warming up"})
+
+
+async def get_dashboard_render_js(request: web.Request) -> web.Response:
+    return web.Response(text=DASHBOARD_RENDER_JS, content_type="application/javascript")
+
+
+async def get_replay_page(request: web.Request) -> web.Response:
+    return web.Response(text=REPLAY_HTML, content_type="text/html")
+
+
+async def handle_replay_dates(request: web.Request) -> web.Response:
+    """Every date this dashboard has a prebuilt historical replay for (see
+    replay_build.py) — the replay page's own date picker, not live state."""
+    if not REPLAY_DATA_DIR.exists():
+        return web.json_response({"dates": []})
+    dates = sorted(p.stem for p in REPLAY_DATA_DIR.glob("*.json") if _REPLAY_DATE_RE.match(p.stem))
+    return web.json_response({"dates": dates})
+
+
+async def handle_replay_data(request: web.Request) -> web.Response:
+    date = request.match_info.get("date", "")
+    if not _REPLAY_DATE_RE.match(date):
+        return web.json_response({"error": "date must be YYYY-MM-DD"}, status=400)
+    path = REPLAY_DATA_DIR / f"{date}.json"
+    if not path.is_file():
+        return web.json_response({"error": f"no replay built for {date}"}, status=404)
+    return web.Response(text=path.read_text(encoding="utf-8"), content_type="application/json")
 
 
 # ============================================================
@@ -312,8 +349,12 @@ def build_app() -> web.Application:
     app.router.add_post("/login", post_login)
     app.router.add_get("/logout", get_logout)
     app.router.add_get("/", get_dashboard)
+    app.router.add_get("/dashboard_render.js", get_dashboard_render_js)
     app.router.add_get("/api/state", handle_state)
     app.router.add_get("/ws", handle_ws)
+    app.router.add_get("/replay", get_replay_page)
+    app.router.add_get("/api/replay-dates", handle_replay_dates)
+    app.router.add_get("/api/replay/{date}", handle_replay_data)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
