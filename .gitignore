@@ -4,6 +4,10 @@ alert_state.json
 strangle_state.json
 hedge_state.json
 pnl_monitor.log
+long_option_state.json
+long_option_engine.log
+nifty_decision_tick_log.jsonl
+nifty_decision_trade_log.jsonl
 __pycache__/
 *.pyc
 venv/

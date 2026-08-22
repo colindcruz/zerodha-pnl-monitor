@@ -490,6 +490,8 @@ Other files:
 | `test_*.py` | Developer test/dry-run scripts, not run automatically — useful if you're modifying the code yourself |
 | `live-dashboard/` | A **separate, independent** read-only live market-data viewer (own process, own venv, own `.env`) — see section 11. Not part of the trading bot. |
 | `live-dashboard.service`, `Caddyfile` | systemd unit + reverse-proxy config for deploying the live dashboard — see section 11.3 |
+| `nifty-decision-dashboard/` | A **separate, independent** advisory decision dashboard (own process, own venv, own `.env`) — see section 12. Places no orders. |
+| `nifty-decision-dashboard.service` | systemd unit for deploying the decision dashboard — see section 12.3 (shares `Caddyfile` with section 11's dashboard, on its own site block) |
 
 ---
 
@@ -580,6 +582,126 @@ rotate `DASHBOARD_PASSWORD`/`DASHBOARD_SESSION_SECRET` while you're at it.
 No P&L, no alerting, no order placement — this dashboard only ever reads market data.
 If you want live P&L on it too, that's a separate feature to design (it would need to
 know your actual entry fills, which this process currently has no access to).
+
+---
+
+## 12. NIFTY decision dashboard
+
+`nifty-decision-dashboard/` is a **separate, independent process** — not part of the
+trading bot, not part of `live-dashboard/`, does not touch `strangle_state.json`/
+`hedge_state.json`/`long_option_state.json`, and **never places an order**. It converts
+live NIFTY market data into small, actionable trading decisions — not a charting app,
+there are no candlestick charts anywhere in it. Four independently-computed engines
+(Trend, Entry, Location/Extension, Position Management) feed a combinator (Entry
+Permission / Trade Direction) that a human reads and manually acts on through some other
+channel.
+
+> ⚠️ Phase 1 is advisory-only by design. It generates signals; it does not, and currently
+> cannot, place orders. Like `live-dashboard/`, it reads the **same** `.access_token` the
+> trading bot uses, so it needs `auto_token.py`'s daily refresh to also restart it —
+> already wired in (see 12.2).
+
+### 12.1 What it is
+
+- `nifty-decision-dashboard/server.py` — an `aiohttp` server, same auth pattern as
+  `live-dashboard/server.py` (password-protected login, signed session cookie), one
+  read-only `KiteTicker` connection on the NIFTY 50 index, and a WebSocket that pushes
+  the full recomputed decision state to every connected browser roughly every
+  `RECOMPUTE_INTERVAL_SECONDS`.
+- `nifty-decision-dashboard/state.py` — the orchestrator: candle backfill/accumulation
+  → indicator snapshot → the four engines → JSONL logging → the state served to
+  browsers.
+- `trend_engine.py` / `entry_engine.py` / `location_engine.py` / `decision_engine.py` /
+  `position_engine.py` — the five pure-logic modules (four engines plus the combinator).
+  Each is independently unit-tested (`test_trend_engine.py` etc.) against synthetic
+  candle data, with zero Kite session required.
+- `indicators.py` / `candles.py` / `snapshot.py` — pure-Python EMA/ATR/DMI/ADX/Aroon/
+  VWAP/price-structure/S-R math and the 09:15-IST-anchored candle bucketing that feeds
+  it, mirroring `with-websockets/pnl_monitor.py`'s `_fetch_atr` in style (plain lists,
+  defensive bail-outs, no numpy/pandas).
+- `dashboard.html` — the browser page: a **Trading Mode** (glanceable — the Entry
+  Permission verdict, trend/entry/location scores, key levels, positions, what-changed
+  feed) and a **Detailed Mode** toggle showing every engine's raw votes/components.
+  `login.html` — the login page.
+- `nifty_decision_tick_log.jsonl` / `nifty_decision_trade_log.jsonl` — *(created
+  automatically)* full per-tick engine state and detected trade-lifecycle events
+  (entry/exit **detection**, not order placement), for later threshold tuning/
+  backtesting.
+- Binds to `127.0.0.1:8766` only — see 12.3 for how it's exposed.
+
+### 12.2 First-time setup
+
+1. `mkdir -p /opt/nifty-decision-dashboard && cd /opt/nifty-decision-dashboard`
+2. Copy every `.py` file, `dashboard.html`, `login.html`, and `requirements.txt` from
+   `nifty-decision-dashboard/` in this repo into that directory (same deploy method
+   already used for `/opt/pnl-monitor` and `/opt/live-dashboard` — see section 3).
+3. `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
+4. Copy `nifty-decision-dashboard/.env.example` to `/opt/nifty-decision-dashboard/.env`
+   and fill in:
+   - `KITE_API_KEY` — same value as the bot's `.env`.
+   - `ACCESS_TOKEN_PATH` — path to the bot's `.access_token` (use an explicit absolute
+     path if this isn't deployed one level under the bot's own directory, e.g.
+     `/opt/pnl-monitor/.access_token`).
+   - `DECISION_DASHBOARD_PASSWORD` — the login password.
+   - `DECISION_DASHBOARD_SESSION_SECRET` — generate with
+     `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+   - `STRANGLE_STATE_FILE` / `HEDGE_STATE_FILE` / `LONG_OPTION_STATE_FILE` — absolute
+     paths to those files if not deployed one level under this directory.
+5. Install the systemd unit: copy `nifty-decision-dashboard.service` to
+   `/etc/systemd/system/nifty-decision-dashboard.service`, then
+   `systemctl daemon-reload && systemctl enable --now nifty-decision-dashboard`.
+6. Confirm `auto_token.py`'s daily run restarts it too — it already calls
+   `systemctl restart nifty-decision-dashboard` (non-fatal if that service isn't
+   installed on a given box) after refreshing the token, right after restarting
+   `live-dashboard`.
+
+### 12.3 Exposing it over HTTPS
+
+Shares the same Caddy install as section 11.3, on its **own site block and hostname**
+(`Caddyfile`, repo root, already has both) — a nip.io **subdomain**
+(`nifty.157-245-102-152.nip.io`) rather than a path prefix on the existing block, since
+`dashboard.html`/`login.html` use root-absolute URLs that a path-stripping proxy would
+break:
+
+1. If Caddy isn't already installed for section 11, install it (see caddyserver.com).
+2. Copy `Caddyfile` (repo root — already contains both site blocks) to
+   `/etc/caddy/Caddyfile`.
+3. Ports 80/443 open, same as section 11.3.
+4. `systemctl restart caddy`.
+5. Visit `https://nifty.157-245-102-152.nip.io` — you should land on the login page with
+   a valid padlock.
+
+If the droplet's IP ever changes, update **both** hostnames in `Caddyfile`, and rotate
+`DECISION_DASHBOARD_PASSWORD`/`DECISION_DASHBOARD_SESSION_SECRET` (and section 11's
+equivalents) while you're at it.
+
+### 12.4 Using it
+
+- **Trading Mode** (default) shows the Entry Permission verdict (ENTER /
+  WAIT_FOR_PULLBACK / NO_TRADE) with its candidate direction and the reasons behind it,
+  Trend/Entry/Extension/Runway at a glance, the key-levels panel, every NIFTY-related
+  position in the account with its Position Management health state, and a "what
+  changed" feed of only the moments something actually transitioned.
+- **Detailed Mode** (toggle, top right) additionally shows every engine's raw votes/
+  component scores/reasons — useful for understanding *why* a verdict fired, or for
+  spotting a TWAP-fallback flag on VWAP (shown when the underlying session has no real
+  traded volume — NIFTY 50 is an index, not a traded instrument, so this is worth
+  watching on your first live session).
+- The connection badge reads **Live** / **Reconnecting…**, same auto-reconnect-with-
+  backoff behavior as `live-dashboard/`.
+- **The Position panel intentionally tracks every NIFTY position in the account**,
+  including ones already owned by the automated strangle/hedge system and the
+  long-option engine — its health verdict for those may disagree with what the owning
+  system is actually doing about them. That's expected, not a bug: this engine's
+  trend-failure logic doesn't know about those systems' own separate management rules.
+
+### 12.5 Explicitly out of scope (Phase 1)
+
+- **No order placement of any kind.** Every decision this dashboard produces is
+  advisory; a human places every order manually through some other channel.
+- No P&L tracking, no position sizing/risk-budget guidance.
+- No backtesting UI yet — the JSONL logs exist specifically so that can be built later
+  without re-instrumenting anything.
 
 ---
 

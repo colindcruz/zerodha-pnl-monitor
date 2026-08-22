@@ -11,3 +11,14 @@
 157-245-102-152.nip.io {
 	reverse_proxy 127.0.0.1:8765
 }
+
+# NIFTY decision dashboard — a second, independent site block on a nip.io
+# SUBDOMAIN (nip.io supports arbitrary labels before the IP-encoded part, so
+# this needs no new DNS setup) rather than a path prefix on the block above.
+# live-dashboard's own HTML/JS use root-absolute URLs (fetch("/api/..."),
+# action="/login"), which a path-stripping reverse proxy would break; a
+# separate hostname/site block sidesteps that entirely and gets its own
+# independently-renewed Let's Encrypt cert via SNI for free.
+nifty.157-245-102-152.nip.io {
+	reverse_proxy 127.0.0.1:8766
+}

@@ -126,6 +126,15 @@ def run():
     if dashboard_restarted:
         print("Live dashboard restarted.")
 
+    # Step 8: same idea for the NIFTY decision dashboard — its own Kite
+    # session, own KiteTicker connection, needs a fresh one every morning.
+    # Also optional/not-fatal, same reasoning as step 7.
+    decision_dashboard_restarted = subprocess.run(
+        ["systemctl", "restart", "nifty-decision-dashboard"], check=False,
+    ).returncode == 0
+    if decision_dashboard_restarted:
+        print("NIFTY decision dashboard restarted.")
+
     notify("✅ Token generated & monitor restarted. Ready for 9:15 AM.")
 
 
