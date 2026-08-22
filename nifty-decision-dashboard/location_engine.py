@@ -55,14 +55,15 @@ class LocationResult:
     insufficient_data: bool = False
 
 
-def _extension(price: float, vwap_v: Optional[float], ema_fast: Optional[float], ema_fast_period: int,
-                atr_v: Optional[float], cfg: LocationEngineConfig) -> tuple[ExtensionLevel, Optional[float], str]:
+def _extension(price: float, vwap_price: Optional[float], vwap_v: Optional[float], ema_fast: Optional[float],
+                ema_fast_period: int, atr_v: Optional[float],
+                cfg: LocationEngineConfig) -> tuple[ExtensionLevel, Optional[float], str]:
     if atr_v is None or atr_v == 0 or (vwap_v is None and ema_fast is None):
         return ExtensionLevel.NORMAL, None, "Extension: insufficient data (defaulting to NORMAL)"
 
     dists = []
-    if vwap_v is not None:
-        dists.append(abs(price - vwap_v))
+    if vwap_v is not None and vwap_price is not None:
+        dists.append(abs(vwap_price - vwap_v))
     if ema_fast is not None:
         dists.append(abs(price - ema_fast))
     atr_dist = max(dists) / atr_v
@@ -121,11 +122,13 @@ def evaluate_location(snapshot: IndicatorSnapshot, direction: str, cfg: Location
                                reasons=["insufficient data"], insufficient_data=True)
 
     price = tf.candles[-1]["close"]
+    vwap_price = tf.vwap_price[-1] if tf.vwap_price else None
     vwap_v = tf.vwap_value[-1]
     ema_fast = tf.ema_fast[-1]
     atr_v = tf.atr[-1]
 
-    ext_level, ext_dist, ext_reason = _extension(price, vwap_v, ema_fast, snapshot.config.ema_fast_period, atr_v, cfg)
+    ext_level, ext_dist, ext_reason = _extension(price, vwap_price, vwap_v, ema_fast,
+                                                  snapshot.config.ema_fast_period, atr_v, cfg)
     run_level, ratio, level_price, run_reason = _runway(price, direction, snapshot.sr_levels, atr_v, cfg)
 
     insufficient = ext_dist is None or atr_v is None

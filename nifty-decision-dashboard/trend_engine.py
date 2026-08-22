@@ -124,17 +124,17 @@ def _vote_ema_structure(tf: TimeframeIndicators, cfg: TrendEngineConfig,
 
 
 def _vote_vwap(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> tuple[int, str]:
-    price = tf.candles[-1]["close"] if tf.candles else None
+    vwap_price = tf.vwap_price[-1] if tf.vwap_price else None
     vwap_now = tf.vwap_value[-1]
     atr_v = tf.atr[-1]
-    if price is None or vwap_now is None or atr_v is None or atr_v == 0:
+    if vwap_price is None or vwap_now is None or atr_v is None or atr_v == 0:
         return 0, "VWAP: insufficient data"
 
     lookback = cfg.vwap_slope_lookback_bars
     vwap_prior = tf.vwap_value[-1 - lookback] if len(tf.vwap_value) > lookback else None
 
     position_signal = 0
-    dist = price - vwap_now
+    dist = vwap_price - vwap_now
     threshold = cfg.vwap_position_atr_threshold * atr_v
     if dist >= threshold:
         position_signal = 1

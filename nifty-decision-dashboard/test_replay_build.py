@@ -188,6 +188,72 @@ check("ReplayKite.historical_data() passes through to the underlying session",
 
 
 # ============================================================
+print("\n=== build_replay: VWAP sourced from NIFTY futures ===")
+# ============================================================
+class FakeKiteWithFutures(FakeKite):
+    """Adds instruments() (so resolve_nifty_futures_contract can find a
+    contract) and a second, real-volume candle series for that futures
+    token — mirrors the real NIFTY 50 (no volume) vs. futures (real
+    volume) situation this feature exists for."""
+
+    def __init__(self, day_candles, prev_day_candles, futures_candles,
+                 futures_token=777, futures_symbol="NIFTY26SEPFUT", spot_token=256265):
+        super().__init__(day_candles, prev_day_candles, spot_token)
+        self._futures_candles = futures_candles
+        self._futures_token = futures_token
+        self._futures_symbol = futures_symbol
+
+    def instruments(self, exchange):
+        return [{"name": "NIFTY", "instrument_type": "FUT", "expiry": date(2099, 1, 1),
+                 "instrument_token": self._futures_token, "tradingsymbol": self._futures_symbol}]
+
+    def historical_data(self, token, from_date, to_date, interval):
+        if token == self._futures_token:
+            return self._futures_candles
+        return super().historical_data(token, from_date, to_date, interval)
+
+
+zero_vol_day = candles_from_closes(steady_trend(24000, 0.5, 375), volume=0)  # simulates the real index
+futures_day = candles_from_closes([p + 40 for p in steady_trend(24000, 0.5, 375)], volume=800)  # real volume, a premium
+
+with tempfile.TemporaryDirectory() as d:
+    replay_build.REPLAY_DATA_DIR = Path(d)
+    fut_kite = FakeKiteWithFutures(zero_vol_day, prev_day, futures_day)
+    out_path3 = build_replay(REPLAY_DATE, kite=fut_kite)
+    bars = json.loads(out_path3.read_text())
+
+    check("no TWAP fallback once futures data is available (from the 2nd bar on — 1st has no prior bar to sample)",
+          not any(b["vwap_is_twap_fallback"] for b in bars[1:]), str([b["vwap_is_twap_fallback"] for b in bars[1:4]]))
+
+    # Compare against a second replay of the SAME index data with no
+    # futures source at all (pure TWAP off the zero-volume index) — a
+    # direct spot-vs-VWAP comparison would conflate the futures premium
+    # with VWAP's own session-average lag behind a trending price, so this
+    # isolates just the premium's effect instead.
+    with tempfile.TemporaryDirectory() as d2:
+        replay_build.REPLAY_DATA_DIR = Path(d2)
+        no_fut_kite = FakeKite(zero_vol_day, prev_day)  # no instruments() at all -> resolution fails gracefully
+        out_path_no_fut = build_replay(REPLAY_DATE, kite=no_fut_kite)
+        bars_no_fut = json.loads(out_path_no_fut.read_text())
+
+    last_bar = bars[-1]
+    last_bar_no_fut = bars_no_fut[-1]
+    check("VWAP with a futures source differs from (and is higher than) the TWAP-only value, "
+          "consistent with the futures' +40 premium",
+          last_bar["trend_detail"]["vwap"] > last_bar_no_fut["trend_detail"]["vwap"],
+          f"with_futures={last_bar['trend_detail']['vwap']} vs twap_only={last_bar_no_fut['trend_detail']['vwap']}")
+
+    # No lookahead: an EARLY bar's VWAP must only reflect futures data up to
+    # that same point in time, not the full day's futures data baked in
+    # from the start.
+    early_bar = bars[2]  # 3rd bar — only a few minutes of futures history should exist yet
+    full_day_futures_vwap_at_end = last_bar["trend_detail"]["vwap"]
+    check("an early bar's VWAP differs from the full day's final VWAP (proves it isn't peeking ahead)",
+          early_bar["trend_detail"]["vwap"] != full_day_futures_vwap_at_end,
+          f"early={early_bar['trend_detail']['vwap']} vs final={full_day_futures_vwap_at_end}")
+
+
+# ============================================================
 print("\n" + "=" * 60)
 if failures:
     print(f"{len(failures)} FAILURE(S):")

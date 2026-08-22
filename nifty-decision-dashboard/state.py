@@ -49,6 +49,48 @@ from trend_engine import TrendDirection, evaluate_trend
 
 log = logging.getLogger("nifty-decision-dashboard")
 
+
+def _instrument_expiry_date(instrument: dict):
+    """Normalizes an NFO instrument dict's "expiry" field to a plain date —
+    mirrors live-dashboard/server.py's _norm_expiry (kite.instruments()
+    sometimes returns a datetime, sometimes a date, depending on library
+    version)."""
+    e = instrument["expiry"]
+    return e.date() if hasattr(e, "date") else e
+
+
+def resolve_nifty_futures_contract(kite, as_of) -> tuple:
+    """The nearest NIFTY futures contract that hasn't expired as of
+    `as_of` (a date) — the current front-month contract for a live lookup,
+    or whichever contract was front-month on a given past date for a
+    replay. Returns (instrument_token, tradingsymbol), or (None, None) if
+    the lookup fails or nothing qualifies — NEVER raises, since VWAP simply
+    falls back to the index's own (TWAP-fallback) computation when this
+    comes back empty; a futures-resolution hiccup must never take down
+    recompute() as a whole.
+
+    Shared between DashboardState (live, "as of today") and
+    replay_build.py (historical, "as of the replay date") — both live in
+    this same service/directory, so importing rather than duplicating is
+    the repo's normal convention here (unlike across separate deployed
+    services, e.g. live-dashboard/ vs this one)."""
+    try:
+        instruments = kite.instruments("NFO")
+    except Exception as exc:
+        log.warning("NIFTY futures instrument lookup failed: %s", exc)
+        return None, None
+
+    candidates = [
+        i for i in instruments
+        if i.get("name") == "NIFTY" and i.get("instrument_type") == "FUT"
+        and _instrument_expiry_date(i) >= as_of
+    ]
+    if not candidates:
+        log.warning("No unexpired NIFTY futures contract found as of %s", as_of)
+        return None, None
+    nearest = min(candidates, key=_instrument_expiry_date)
+    return nearest["instrument_token"], nearest["tradingsymbol"]
+
 _BULLISH = {TrendDirection.STRONG_BULL, TrendDirection.BULL, TrendDirection.WEAK_BULL}
 _BEARISH = {TrendDirection.STRONG_BEAR, TrendDirection.BEAR, TrendDirection.WEAK_BEAR}
 
@@ -87,6 +129,17 @@ class DashboardState:
 
         self.spot_token: Optional[int] = None
         self.accumulator = OneMinuteAccumulator()
+        # NIFTY futures — used ONLY as a VWAP source (see snapshot.py):
+        # the index itself carries no real traded volume, but the current
+        # front-month futures contract does. Every other indicator still
+        # comes from the index (self.accumulator) as always. Left
+        # unresolved (None) on a machine/session that never calls
+        # resolve_futures_token() — recompute() then falls back to
+        # computing VWAP from the index's own candles (with its own TWAP
+        # fallback), exactly as it did before this existed.
+        self.futures_token: Optional[int] = None
+        self.futures_tradingsymbol: Optional[str] = None
+        self.futures_accumulator = OneMinuteAccumulator()
         self.event_feed = EventFeed()
         self.position_engines: dict[str, PositionHealthEngine] = {}
         self.tracked_trades: dict[str, TrackedTrade] = {}
@@ -126,6 +179,32 @@ class DashboardState:
             return
         self.accumulator.seed_from_historical(normalize_historical(raw))
 
+    def resolve_futures_token(self, now: datetime = None) -> Optional[int]:
+        now = now or datetime.now(IST)
+        token, symbol = resolve_nifty_futures_contract(self.kite, now.astimezone(IST).date())
+        self.futures_token = token
+        self.futures_tradingsymbol = symbol
+        if token:
+            log.info("Resolved NIFTY futures contract for VWAP: %s (token %s)", symbol, token)
+        return token
+
+    def backfill_futures(self, now: datetime = None) -> None:
+        """Same window as backfill() (09:15 IST through `now`), for the
+        futures contract instead of the index — used only for VWAP. A
+        no-op if the contract hasn't been resolved or the fetch fails; VWAP
+        just stays sourced from the index in that case."""
+        if self.futures_token is None:
+            return
+        now = now or datetime.now(IST)
+        session_start_str = now.astimezone(IST).strftime("%Y-%m-%d 09:15:00")
+        now_str = now.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            raw = self.kite.historical_data(self.futures_token, session_start_str, now_str, "minute")
+        except Exception as exc:
+            log.warning("Futures backfill failed: %s", exc)
+            return
+        self.futures_accumulator.seed_from_historical(normalize_historical(raw))
+
     def fetch_prev_day_ohlc(self, now: datetime = None) -> None:
         now = now or datetime.now(IST)
         token = self.resolve_spot_token()
@@ -146,6 +225,9 @@ class DashboardState:
 
     def on_tick(self, ts: datetime, price: float, cum_volume: Optional[float] = None) -> None:
         self.accumulator.on_tick(ts, price, cum_volume)
+
+    def on_futures_tick(self, ts: datetime, price: float, cum_volume: Optional[float] = None) -> None:
+        self.futures_accumulator.on_tick(ts, price, cum_volume)
 
     # -- positions -----------------------------------------------------------
 
@@ -272,8 +354,8 @@ class DashboardState:
         hard-coding a period number that goes stale the next time
         config.py's periods are retuned."""
         tf = snapshot.tf5
-        price = tf.candles[-1]["close"] if tf.candles else None
         vwap_v = tf.vwap_value[-1]
+        vwap_price = tf.vwap_price[-1] if tf.vwap_price else None
         highs = [p for p in snapshot.swing_points_5m if p.kind == "high" and p.label]
         lows = [p for p in snapshot.swing_points_5m if p.kind == "low" and p.label]
         return {
@@ -281,7 +363,11 @@ class DashboardState:
             "ema_fast": tf.ema_fast[-1], "ema_slow": tf.ema_slow[-1],
             "ema_fast_period": snapshot.config.ema_fast_period, "ema_slow_period": snapshot.config.ema_slow_period,
             "vwap": vwap_v,
-            "vwap_distance_points": (price - vwap_v) if (price is not None and vwap_v is not None) else None,
+            # Compared against vwap_price (same-instrument as VWAP's own
+            # source, e.g. futures close), not the index close — otherwise
+            # this bakes in the futures-index premium as a structural offset
+            # on every reading. See snapshot.py's module docstring.
+            "vwap_distance_points": (vwap_price - vwap_v) if (vwap_price is not None and vwap_v is not None) else None,
             "plus_di": tf.dmi_adx.plus_di[-1], "minus_di": tf.dmi_adx.minus_di[-1], "adx": tf.dmi_adx.adx[-1],
             "atr": tf.atr[-1],
             "structure_label": f"{highs[-1].label}/{lows[-1].label}" if highs and lows else None,
@@ -315,7 +401,8 @@ class DashboardState:
         if not one_min:
             return self.latest
 
-        snapshot = build_snapshot(one_min, self.cfg.indicator)
+        futures_one_min = self.futures_accumulator.as_sorted_list()
+        snapshot = build_snapshot(one_min, self.cfg.indicator, vwap_source_candles=futures_one_min or None)
         spot = one_min[-1]["close"]
 
         new_bar = bool(snapshot.tf5.candles) and (

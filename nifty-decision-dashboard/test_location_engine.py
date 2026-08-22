@@ -31,12 +31,13 @@ T0 = datetime(2026, 8, 20, 9, 15, 0, tzinfo=IST)
 DUMMY_CANDLE = {"date": T0, "open": 24000, "high": 24010, "low": 23990, "close": 24000, "volume": 100}
 
 
-def make_snapshot(price, vwap_v, ema20, atr_v, sr_levels):
+def make_snapshot(price, vwap_v, ema20, atr_v, sr_levels, vwap_price=None):
     tf = TimeframeIndicators(
         candles=[{**DUMMY_CANDLE, "close": price}],
         ema_fast=[ema20], ema_slow=[ema20], atr=[atr_v],
         aroon=aroon([DUMMY_CANDLE], 14), dmi_adx=dmi_adx([DUMMY_CANDLE], 14, 14),
         vwap_value=[vwap_v], vwap_is_twap=[False],
+        vwap_price=[vwap_price if vwap_price is not None else price],
     )
     return IndicatorSnapshot(config=IndicatorConfig(), candles_1m=[], tf2=tf, tf5=tf,
                               opening_range=None, swing_points_5m=[], sr_levels=sr_levels)
@@ -65,6 +66,21 @@ check("price ~30pts / 20 ATR = 1.5 ATR -> EXTENDED (between normal and very-exte
 check("extension uses the MORE distant of VWAP/EMA20",
       evaluate_location(make_snapshot(24000, vwap_v=23999, ema20=23900, atr_v=20, sr_levels=[]), "LONG", cfg)
       .extension == ExtensionLevel.VERY_EXTENDED)  # close to VWAP but 5 ATR from EMA20
+
+# VWAP distance must use vwap_price (the same instrument VWAP was computed
+# from, e.g. futures close), not the index close — otherwise a futures-index
+# premium alone would read as "extended" with zero real price movement.
+# Index price == VWAP exactly (0 distance); a +50 futures premium (vwap_price
+# 50pts above vwap_v) must NOT count as extension since the pair is
+# consistent (0 ATR distance in futures terms). EMA sits far away (100pts /
+# 20 ATR = 5) so the correct result is VERY_EXTENDED only because of the EMA
+# leg, not the (irrelevant) VWAP leg.
+snap_premium_but_flat = make_snapshot(price=24000, vwap_v=23950, ema20=23900, atr_v=20, sr_levels=[],
+                                       vwap_price=23950)
+res_premium = evaluate_location(snap_premium_but_flat, "LONG", cfg)
+check("a futures premium alone (index price == VWAP) contributes zero VWAP extension",
+      res_premium.extension == ExtensionLevel.VERY_EXTENDED and res_premium.extension_atr_distance == 5.0,
+      f"extension={res_premium.extension} dist={res_premium.extension_atr_distance}")
 
 
 # ============================================================

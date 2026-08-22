@@ -61,6 +61,44 @@ check("no VWAP TWAP-fallback flagged for a normal-volume session", not any(snap.
 
 
 # ============================================================
+print("\n=== VWAP sourced from a separate instrument (e.g. NIFTY futures) ===")
+# ============================================================
+zero_vol_index = candles_from_closes(prices, volume=0)  # simulates the real NIFTY 50 index: no real volume
+no_futures_snap = build_snapshot(zero_vol_index, cfg)
+check("without a futures source: a zero-volume index falls back to TWAP",
+      any(no_futures_snap.tf5.vwap_is_twap))
+
+# A separate "futures" price series, at a deliberate premium to the index so
+# the test can tell which series actually got used, with real volume.
+futures_prices = [p + 50 for p in prices]
+futures_candles = candles_from_closes(futures_prices, volume=500)
+with_futures_snap = build_snapshot(zero_vol_index, cfg, vwap_source_candles=futures_candles)
+check("with a futures source: TWAP fallback no longer flagged",
+      not any(with_futures_snap.tf5.vwap_is_twap))
+
+futures_v1m = vwap(futures_candles)
+check("VWAP actually comes from the futures series, not the index's own (TWAP) computation",
+      with_futures_snap.tf5.vwap_value[-1] == futures_v1m.value[-1],
+      f"{with_futures_snap.tf5.vwap_value[-1]} vs {futures_v1m.value[-1]}")
+check("...and is therefore clearly different from the index-only (TWAP) value",
+      with_futures_snap.tf5.vwap_value[-1] != no_futures_snap.tf5.vwap_value[-1],
+      f"{with_futures_snap.tf5.vwap_value[-1]} vs {no_futures_snap.tf5.vwap_value[-1]}")
+
+check("every OTHER indicator (e.g. EMA) is unaffected by which series VWAP came from",
+      with_futures_snap.tf5.ema_fast[-1] == no_futures_snap.tf5.ema_fast[-1],
+      f"{with_futures_snap.tf5.ema_fast[-1]} vs {no_futures_snap.tf5.ema_fast[-1]}")
+check("tf2 VWAP is also sourced from futures", with_futures_snap.tf2.vwap_value[-1] is not None
+      and not with_futures_snap.tf2.vwap_is_twap[-1])
+
+check("vwap_price (paired with VWAP for distance comparisons) is the FUTURES close, not the index close",
+      with_futures_snap.tf5.vwap_price[-1] == futures_candles[-1]["close"],
+      f"{with_futures_snap.tf5.vwap_price[-1]} vs futures={futures_candles[-1]['close']} "
+      f"index={zero_vol_index[-1]['close']}")
+check("without a futures source, vwap_price falls back to the index's own close (same series VWAP used)",
+      no_futures_snap.tf5.vwap_price[-1] == zero_vol_index[-1]["close"])
+
+
+# ============================================================
 print("\n=== warmup: enough history for every indicator to be non-None ===")
 # ============================================================
 check("tf5 EMA(slow) is non-None at the last bar", snap.tf5.ema_slow[-1] is not None)

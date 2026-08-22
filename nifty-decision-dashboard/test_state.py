@@ -45,6 +45,53 @@ check("2 tf5 bars -> prev_5min_close is the FIRST (completed) bar's close, not t
       DashboardState._prev_5min_close(_two_bar_snap) == 24000.0, str(DashboardState._prev_5min_close(_two_bar_snap)))
 
 
+from datetime import date  # noqa: E402
+from state import resolve_nifty_futures_contract  # noqa: E402
+
+
+class FakeInstrumentsKite:
+    """Minimal fake — only instruments() — for testing
+    resolve_nifty_futures_contract() in isolation."""
+
+    def __init__(self, instruments=None, raise_on_call=False):
+        self._instruments = instruments or []
+        self._raise = raise_on_call
+
+    def instruments(self, exchange):
+        if self._raise:
+            raise RuntimeError("simulated API failure")
+        return self._instruments
+
+
+def _fut(name, expiry, token, symbol):
+    return {"name": name, "instrument_type": "FUT", "expiry": expiry, "instrument_token": token,
+            "tradingsymbol": symbol}
+
+
+# ============================================================
+print("\n=== resolve_nifty_futures_contract ===")
+# ============================================================
+multi_expiry = [
+    _fut("NIFTY", date(2026, 8, 27), 111, "NIFTY26AUGFUT"),   # already expired as of 2026-08-28
+    _fut("NIFTY", date(2026, 9, 24), 222, "NIFTY26SEPFUT"),   # nearest unexpired
+    _fut("NIFTY", date(2026, 10, 29), 333, "NIFTY26OCTFUT"),  # further out
+    _fut("BANKNIFTY", date(2026, 9, 24), 444, "BANKNIFTY26SEPFUT"),  # must be excluded (wrong name)
+]
+token, symbol = resolve_nifty_futures_contract(FakeInstrumentsKite(multi_expiry), date(2026, 8, 28))
+check("picks the nearest UNEXPIRED NIFTY contract, skipping the already-expired one",
+      token == 222 and symbol == "NIFTY26SEPFUT", f"{token} {symbol}")
+
+token2, symbol2 = resolve_nifty_futures_contract(FakeInstrumentsKite([]), date(2026, 8, 28))
+check("no instruments at all -> (None, None), no exception", token2 is None and symbol2 is None)
+
+token3, symbol3 = resolve_nifty_futures_contract(
+    FakeInstrumentsKite([_fut("BANKNIFTY", date(2026, 9, 24), 444, "BANKNIFTY26SEPFUT")]), date(2026, 8, 28))
+check("only BANKNIFTY present (no NIFTY) -> (None, None)", token3 is None and symbol3 is None)
+
+token4, symbol4 = resolve_nifty_futures_contract(FakeInstrumentsKite(raise_on_call=True), date(2026, 8, 28))
+check("instruments() raising -> (None, None), never propagates", token4 is None and symbol4 is None)
+
+
 class FakeKite:
     def __init__(self, one_min_candles, prev_day_candles, positions_sequence, spot_token=256265):
         self.spot_token = spot_token
@@ -211,6 +258,86 @@ with tempfile.TemporaryDirectory() as d:
         check("json.dumps(state.latest) succeeds with a real event present", True)
     except TypeError as exc:
         check("json.dumps(state.latest) succeeds with a real event present", False, str(exc))
+
+
+# ============================================================
+print("\n=== DashboardState: VWAP sourced from NIFTY futures ===")
+# ============================================================
+class FakeKiteWithFutures:
+    """Like FakeKite, but also serves a resolvable futures contract (its
+    own instruments() + historical_data() by token) with REAL volume,
+    unlike the index candles here which deliberately carry none — mirrors
+    the real NIFTY 50 (no volume) vs. NIFTY futures (real volume)
+    situation this feature exists for."""
+
+    def __init__(self, spot_candles, futures_candles, futures_token=555,
+                 futures_symbol="NIFTY26SEPFUT", spot_token=256265):
+        self.spot_token = spot_token
+        self._spot_candles = spot_candles
+        self._futures_candles = futures_candles
+        self._futures_token = futures_token
+        self._instruments_list = [_fut("NIFTY", date(2099, 1, 1), futures_token, futures_symbol)]
+
+    def ltp(self, symbols):
+        return {"NSE:NIFTY 50": {"instrument_token": self.spot_token, "last_price": self._spot_candles[-1]["close"]}}
+
+    def instruments(self, exchange):
+        return self._instruments_list
+
+    def historical_data(self, token, from_date, to_date, interval):
+        if token == self._futures_token:
+            return self._futures_candles
+        if token == self.spot_token:
+            return self._spot_candles
+        return []  # no prev-day data needed for this test
+
+    def positions(self):
+        return {"net": []}
+
+
+with tempfile.TemporaryDirectory() as d:
+    fut_prices = steady_trend(24000, 1.0, n)
+    spot_candles_zero_vol = candles_from_closes(fut_prices, volume=0)          # simulates the real index: no volume
+    futures_candles_real_vol = candles_from_closes([p + 40 for p in fut_prices], volume=1000)  # a premium, real volume
+
+    fut_kite = FakeKiteWithFutures(spot_candles_zero_vol, futures_candles_real_vol)
+    fut_state = DashboardState(
+        fut_kite, DashboardConfig(),
+        tick_log_path=Path(d) / "tick.jsonl", trade_log_path=Path(d) / "trade.jsonl",
+        strangle_state_path=Path(d) / "no_s.json", hedge_state_path=Path(d) / "no_h.json",
+        long_option_state_path=Path(d) / "no_lo.json",
+    )
+    fut_now = spot_candles_zero_vol[-1]["date"]
+    fut_state.resolve_spot_token()
+    fut_state.backfill(fut_now)
+
+    result_no_futures = fut_state.recompute(fut_now)
+    check("before futures are resolved: zero-volume index falls back to TWAP",
+          result_no_futures["vwap_is_twap_fallback"] is True)
+    twap_vwap_value = result_no_futures["trend_detail"]["vwap"]
+
+    resolved_token = fut_state.resolve_futures_token(fut_now)
+    check("futures contract resolved", resolved_token == 555, str(resolved_token))
+    check("futures tradingsymbol captured", fut_state.futures_tradingsymbol == "NIFTY26SEPFUT",
+          str(fut_state.futures_tradingsymbol))
+
+    fut_state.backfill_futures(fut_now)
+    check("futures accumulator populated by backfill_futures",
+          len(fut_state.futures_accumulator.as_sorted_list()) == len(futures_candles_real_vol),
+          str(len(fut_state.futures_accumulator.as_sorted_list())))
+
+    result_with_futures = fut_state.recompute(fut_now)
+    check("once futures are backfilled: TWAP fallback no longer flagged",
+          result_with_futures["vwap_is_twap_fallback"] is False)
+    futures_vwap_value = result_with_futures["trend_detail"]["vwap"]
+    check("VWAP now reflects the futures premium, not the index's own TWAP",
+          futures_vwap_value != twap_vwap_value and futures_vwap_value > twap_vwap_value,
+          f"futures={futures_vwap_value} vs twap={twap_vwap_value}")
+
+    # Live futures ticks feed the SAME accumulator on_futures_tick() writes to.
+    fut_state.on_futures_tick(fut_now + timedelta(minutes=1), 30000.0, cum_volume=999999)
+    check("on_futures_tick() writes into the futures accumulator, not the index one",
+          fut_state.futures_accumulator.as_sorted_list()[-1]["close"] == 30000.0)
 
 
 # ============================================================

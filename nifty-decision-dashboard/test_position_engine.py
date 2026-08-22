@@ -50,7 +50,7 @@ def make_snapshot(price=24100, vwap_v=24050, ema_fast=24080, ema_slow=24050,
         ema_fast=[ema_fast], ema_slow=[ema_slow], atr=[atr_v],
         aroon=AroonResult(up=[aroon_up], down=[aroon_down]),
         dmi_adx=DmiAdxResult(plus_di=[pdi], minus_di=[mdi], adx=[adx_prev, adx_now]),
-        vwap_value=[vwap_v, vwap_v], vwap_is_twap=[False, False],
+        vwap_value=[vwap_v, vwap_v], vwap_is_twap=[False, False], vwap_price=[price, price],
     )
     return IndicatorSnapshot(config=ind_cfg or IndicatorConfig(), candles_1m=[], tf2=tf, tf5=tf,
                               opening_range=None, swing_points_5m=swing_points, sr_levels=sr_levels or [])

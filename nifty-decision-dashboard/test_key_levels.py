@@ -33,7 +33,7 @@ def make_snapshot(price=24000, vwap_v=23980, opening_range=None, sr_levels=None)
     tf = TimeframeIndicators(
         candles=[{**CANDLE, "close": price}], ema_fast=[price], ema_slow=[price], atr=[20],
         aroon=AroonResult(up=[50], down=[50]), dmi_adx=DmiAdxResult(plus_di=[20], minus_di=[20], adx=[20]),
-        vwap_value=[vwap_v], vwap_is_twap=[False],
+        vwap_value=[vwap_v], vwap_is_twap=[False], vwap_price=[price],
     )
     return IndicatorSnapshot(config=IndicatorConfig(), candles_1m=[], tf2=tf, tf5=tf,
                               opening_range=opening_range, swing_points_5m=[], sr_levels=sr_levels or [])
@@ -114,7 +114,7 @@ print("\n=== empty candles -> empty result ===")
 # ============================================================
 empty_tf = TimeframeIndicators(candles=[], ema_fast=[], ema_slow=[], atr=[],
                                 aroon=AroonResult(up=[], down=[]), dmi_adx=DmiAdxResult(plus_di=[], minus_di=[], adx=[]),
-                                vwap_value=[], vwap_is_twap=[])
+                                vwap_value=[], vwap_is_twap=[], vwap_price=[])
 empty_snap = IndicatorSnapshot(config=IndicatorConfig(), candles_1m=[], tf2=empty_tf, tf5=empty_tf,
                                 opening_range=None, swing_points_5m=[], sr_levels=[])
 empty_result = compute_key_levels(empty_snap)

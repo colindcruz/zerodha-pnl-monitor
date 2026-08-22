@@ -50,6 +50,7 @@ def tf_from_candles(candle_list, cfg_ind_periods=(20, 14)):
         dmi_adx=dmi_adx(candle_list, 14, 14),
         vwap_value=v.value,
         vwap_is_twap=v.is_twap_fallback,
+        vwap_price=closes,
     )
 
 

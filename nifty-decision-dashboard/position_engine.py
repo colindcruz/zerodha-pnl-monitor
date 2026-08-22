@@ -145,13 +145,17 @@ def _score_deterioration(snapshot: IndicatorSnapshot, direction: str, cfg: Posit
             signals["important_sr"] = w["important_sr"]
             reasons.append(f"Price broke through an important level near {broken[0].price:.1f}")
 
-    # 3. VWAP: price on the unfavorable side of VWAP.
+    # 3. VWAP: price on the unfavorable side of VWAP. Compared in the same
+    # instrument's terms as VWAP itself was computed from (vwap_price, e.g.
+    # futures close) rather than the index close, so a futures-index
+    # premium never counts as "unfavorable" on its own — see snapshot.py.
     vwap_v = tf.vwap_value[-1]
-    if vwap_v is not None:
-        bad = (direction == "LONG" and price < vwap_v) or (direction == "SHORT" and price > vwap_v)
+    vwap_price = tf.vwap_price[-1] if tf.vwap_price else None
+    if vwap_v is not None and vwap_price is not None:
+        bad = (direction == "LONG" and vwap_price < vwap_v) or (direction == "SHORT" and vwap_price > vwap_v)
         if bad:
             signals["vwap"] = w["vwap"]
-            reasons.append(f"Price is on the unfavorable side of VWAP ({price:.1f} vs {vwap_v:.1f})")
+            reasons.append(f"Price is on the unfavorable side of VWAP ({vwap_price:.1f} vs {vwap_v:.1f})")
 
     # 4. EMA structure: EMA fast has crossed to the unfavorable side of EMA slow.
     fast, slow = tf.ema_fast[-1], tf.ema_slow[-1]

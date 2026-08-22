@@ -6,9 +6,11 @@ A small, fully independent process — does NOT touch with-websockets/
 pnl_monitor.py, long_option_live.py, or live-dashboard/server.py, their
 state files, or their logic. Reads the SAME .access_token file the trading
 bot writes/reads (read-only — no login flow of its own), opens its own
-read-only Kite WebSocket connection on the NIFTY 50 index, and serves a
-browser dashboard converting live market data into small, actionable
-decisions.
+read-only Kite WebSocket connection on the NIFTY 50 index (every indicator
+except VWAP) plus the current-month NIFTY futures contract (VWAP only — the
+index itself carries no real traded volume; see state.py's
+resolve_nifty_futures_contract), and serves a browser dashboard converting
+live market data into small, actionable decisions.
 
 Phase 1 is advisory-only: this process NEVER places an order. Every
 Entry Permission this service emits is something a human reads and then
@@ -200,7 +202,8 @@ async def handle_replay_data(request: web.Request) -> web.Response:
 
 
 # ============================================================
-# KITE — read-only session, one NIFTY 50 index KiteTicker connection
+# KITE — read-only session, one KiteTicker connection subscribed to both
+# the NIFTY 50 index and the current-month NIFTY futures contract (VWAP source)
 # ============================================================
 
 kite = KiteConnect(api_key=API_KEY)
@@ -236,18 +239,22 @@ async def broadcast_state() -> None:
 
 def on_ticks(ws, ticks):
     for tick in ticks:
-        if tick.get("instrument_token") != dashboard_state.spot_token:
-            continue
+        token = tick.get("instrument_token")
         ltt = tick.get("last_trade_time")
         ts = ltt if hasattr(ltt, "isoformat") else datetime.now(IST)
-        dashboard_state.on_tick(ts, tick.get("last_price"), tick.get("volume_traded"))
+        if token == dashboard_state.spot_token:
+            dashboard_state.on_tick(ts, tick.get("last_price"), tick.get("volume_traded"))
+        elif token == dashboard_state.futures_token:
+            dashboard_state.on_futures_tick(ts, tick.get("last_price"), tick.get("volume_traded"))
 
 
 def on_connect(ws, response):
     log.info("Kite ticker connected")
-    token = dashboard_state.resolve_spot_token()
-    ws.subscribe([token])
-    ws.set_mode(ws.MODE_FULL, [token])
+    tokens = [dashboard_state.resolve_spot_token()]
+    if dashboard_state.futures_token:
+        tokens.append(dashboard_state.futures_token)
+    ws.subscribe(tokens)
+    ws.set_mode(ws.MODE_FULL, tokens)
 
 
 def on_close(ws, code, reason):
@@ -322,6 +329,11 @@ async def on_startup(app: web.Application) -> None:
     dashboard_state.resolve_spot_token()
     dashboard_state.backfill(datetime.now(IST))
     dashboard_state.fetch_prev_day_ohlc(datetime.now(IST))
+    # Resolved BEFORE kws.connect() so on_connect()'s initial subscribe
+    # already knows about it — VWAP just stays sourced from the index (its
+    # own TWAP fallback) if this comes back empty, never fatal.
+    dashboard_state.resolve_futures_token(datetime.now(IST))
+    dashboard_state.backfill_futures(datetime.now(IST))
     kws.connect(threaded=True)
     app["recompute_task"] = asyncio.create_task(_recompute_loop())
 

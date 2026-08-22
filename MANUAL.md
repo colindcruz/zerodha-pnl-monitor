@@ -605,12 +605,14 @@ channel.
 
 - `nifty-decision-dashboard/server.py` — an `aiohttp` server, same auth pattern as
   `live-dashboard/server.py` (password-protected login, signed session cookie), one
-  read-only `KiteTicker` connection on the NIFTY 50 index, and a WebSocket that pushes
-  the full recomputed decision state to every connected browser roughly every
-  `RECOMPUTE_INTERVAL_SECONDS`.
+  read-only `KiteTicker` connection subscribed to BOTH the NIFTY 50 index (every
+  indicator except VWAP) and the current-month NIFTY futures contract (VWAP only — the
+  index itself carries no real traded volume; see `state.py`'s
+  `resolve_nifty_futures_contract`), and a WebSocket that pushes the full recomputed
+  decision state to every connected browser roughly every `RECOMPUTE_INTERVAL_SECONDS`.
 - `nifty-decision-dashboard/state.py` — the orchestrator: candle backfill/accumulation
-  → indicator snapshot → the four engines → JSONL logging → the state served to
-  browsers.
+  (index + futures) → indicator snapshot → the four engines → JSONL logging → the state
+  served to browsers.
 - `trend_engine.py` / `entry_engine.py` / `location_engine.py` / `decision_engine.py` /
   `position_engine.py` — the five pure-logic modules (four engines plus the combinator).
   Each is independently unit-tested (`test_trend_engine.py` etc.) against synthetic
@@ -618,11 +620,14 @@ channel.
 - `indicators.py` / `candles.py` / `snapshot.py` — pure-Python EMA/ATR/DMI/ADX/Aroon/
   VWAP/price-structure/S-R math and the 09:15-IST-anchored candle bucketing that feeds
   it, mirroring `with-websockets/pnl_monitor.py`'s `_fetch_atr` in style (plain lists,
-  defensive bail-outs, no numpy/pandas).
-- `dashboard.html` — the browser page: a **Trading Mode** (glanceable — the Entry
-  Permission verdict, trend/entry/location scores, key levels, positions, what-changed
-  feed) and a **Detailed Mode** toggle showing every engine's raw votes/components.
-  `login.html` — the login page.
+  defensive bail-outs, no numpy/pandas). `snapshot.py`'s VWAP computation accepts an
+  optional separate source series (the futures candles) — every other indicator always
+  comes from the index.
+- `dashboard.html` — the main browser page, a single dense view (hero cards, per-engine
+  detail panels, Position Management ladder, Open Position, Trend Summary, Intraday
+  Bias, Alerts). `replay.html` — manual bar-by-bar step-through of a prebuilt historical
+  day (see `replay_build.py`, section 12.4.1). Both share one rendering file,
+  `dashboard_render.js`. `login.html` — the login page.
 - `nifty_decision_tick_log.jsonl` / `nifty_decision_trade_log.jsonl` — *(created
   automatically)* full per-tick engine state and detected trade-lifecycle events
   (entry/exit **detection**, not order placement), for later threshold tuning/
@@ -685,9 +690,13 @@ equivalents) while you're at it.
   and Key Levels (VWAP, pivots, prev-day, opening range, nearest S/R); an Open Position
   card (with T1/T2/stop detail for long-option-owned positions); Trend Summary,
   Intraday Bias, Latest Signal, Upcoming Levels, and an Alerts feed.
-- A TWAP-fallback flag appears next to Key Levels when the underlying session has no
-  real traded volume — NIFTY 50 is an index, not a traded instrument, so this is worth
-  watching on your first live session.
+- A TWAP-fallback flag appears next to Key Levels when VWAP couldn't be computed from
+  real volume — NIFTY 50 itself is an index with no real traded volume, so VWAP is
+  normally sourced from the current-month NIFTY futures contract instead (resolved
+  automatically at startup). The flag only means this fallback is ALSO unavailable —
+  e.g. the futures contract failed to resolve, or hasn't backfilled yet right after a
+  restart — worth checking `journalctl -u nifty-decision-dashboard` if it stays on for
+  more than the first minute or two of a session.
 - The connection badge reads **Live** / **Reconnecting…**, same auto-reconnect-with-
   backoff behavior as `live-dashboard/`.
 - **The Position panel intentionally tracks every NIFTY position in the account**,
@@ -713,6 +722,11 @@ waiting for a live one.
   historical/point-in-time view, so the Position Management and Open Position panels
   are blank throughout every replay by design; this is a Trend/Entry/Location/Decision
   review tool, not a position-history tool.
+- **VWAP is sourced from futures here too** — `replay_build.py` resolves whichever
+  NIFTY futures contract was front-month as of the replay date and fetches its real
+  1-min history alongside the index's, seeding it into each bar in lockstep (never the
+  whole day at once) so no bar's VWAP ever reflects data from later in the session —
+  the same no-lookahead discipline a real backtest needs.
 - **Using the page**: open `/replay`, pick a date from the dropdown (only dates you've
   built appear), then step with the **Prev / Next** buttons or the **◀ / ▶** arrow
   keys — each step is one real 5-min bar, matching the Trend and Position Management

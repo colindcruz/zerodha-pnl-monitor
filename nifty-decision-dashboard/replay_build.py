@@ -42,7 +42,7 @@ from kiteconnect import KiteConnect
 from candles import IST, bucket_start, normalize_historical
 from config import DashboardConfig
 from key_levels import PrevDayOHLC
-from state import DashboardState
+from state import DashboardState, resolve_nifty_futures_contract
 
 load_dotenv()
 
@@ -144,9 +144,33 @@ def build_replay(replay_date: date, kite=None) -> Path:
     else:
         print("WARNING: no prev-day OHLC found — Prev Day / pivot levels will be absent from every bar.")
 
+    # VWAP source: the NIFTY futures contract that was front-month AS OF
+    # replay_date (not "today" — see resolve_nifty_futures_contract), same
+    # reasoning as server.py's live wiring: the index itself carries no
+    # real volume. Missing/failed resolution just means VWAP falls back to
+    # the index's own TWAP throughout this replay, same as it always did.
+    futures_candles: list = []
+    futures_token, futures_symbol = resolve_nifty_futures_contract(kite, replay_date)
+    if futures_token:
+        fut_raw = kite.historical_data(futures_token, day_start.strftime("%Y-%m-%d %H:%M:%S"),
+                                        day_end.strftime("%Y-%m-%d %H:%M:%S"), "minute")
+        futures_candles = normalize_historical(fut_raw) if fut_raw else []
+        state.futures_token = futures_token
+        state.futures_tradingsymbol = futures_symbol
+        print(f"Futures VWAP source: {futures_symbol} ({len(futures_candles)} one-min candles)")
+    else:
+        print("WARNING: no NIFTY futures contract resolved — VWAP will be TWAP-fallback throughout this replay.")
+
     snapshots = []
     for i in range(BARS_PER_STEP, len(candles) + 1, BARS_PER_STEP):
         state.accumulator.seed_from_historical(candles[:i])
+        if futures_candles:
+            # Seeded up to the SAME point in wall-clock time as the index
+            # (not the full day upfront) — feeding the whole day's futures
+            # data in from bar 1 would leak future information into early
+            # bars, exactly the lookahead bias a replay/backtest tool must
+            # never have.
+            state.futures_accumulator.seed_from_historical(futures_candles[:min(i, len(futures_candles))])
         # Label the snapshot by the bar's OWN start time (e.g. 09:15 for the
         # first bar), not the last 1-min candle that completed it (09:19) —
         # candles are conventionally identified by when they open, and
