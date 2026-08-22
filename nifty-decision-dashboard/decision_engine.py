@@ -13,6 +13,19 @@ Location can only VETO a strong Trend+Entry read; it can never promote a
 weak one into ENTER. Entry Permission always carries `reasons` explaining
 exactly which gate passed or failed — this output is read by a human placing
 a manual order, "trust me" is not an acceptable answer here.
+
+`DecisionResult.armed` is a purely additive signal, distinct from
+`permission`: True when the 5-min Trend has qualified (trend_aligned) but
+the 2-min Entry Engine hasn't scored a valid setup yet (not entry_ok) —
+i.e. "bias established, now watching the 2-min chart for a pullback entry,"
+matching this dashboard's documented bias -> permission (5-min) /
+pullback -> structure -> continuation -> entry (2-min) methodology. It is
+never True once entry_ok is True, since at that point the outcome is
+already decided as ENTER or WAIT_FOR_PULLBACK (a different, later kind of
+"waiting" — already-qualified-but-overextended, not "still watching for
+structure"). `permission` itself is untouched by this field; it stays
+exactly the three-way ENTER/WAIT_FOR_PULLBACK/NO_TRADE decision it always
+was.
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ class DecisionResult:
     direction: Optional[str]   # "LONG" | "SHORT" | None (no actionable direction)
     permission: EntryPermission
     reasons: list
+    armed: bool = False  # 5-min bias qualified, 2-min entry setup not yet scored — see module docstring
 
 
 def _trend_sign(direction: TrendDirection) -> int:
@@ -80,7 +94,12 @@ def evaluate_decision(trend: TrendResult, entry: EntryResult, location: Location
                     f"{'meets' if entry_ok else 'does not meet'} the {cfg.min_entry_score_for_entry}-point bar")
 
     if not trend_aligned or not entry_ok:
-        return DecisionResult(direction=candidate_direction, permission=EntryPermission.NO_TRADE, reasons=reasons)
+        armed = trend_aligned and not entry_ok
+        if armed:
+            reasons.append(f"ARMED: 5-min bias qualifies for {candidate_direction}, "
+                            f"watching the 2-min chart for a pullback entry")
+        return DecisionResult(direction=candidate_direction, permission=EntryPermission.NO_TRADE,
+                               reasons=reasons, armed=armed)
 
     location_veto = (location.extension.value in cfg.veto_extension_levels
                       or location.runway.value in cfg.veto_runway_levels)

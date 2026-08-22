@@ -28,7 +28,8 @@
   // Small render helpers
   // ---------------------------------------------------------------
   function toneClass(kind, value) {
-    if (kind === "decision") return value === "ENTER" ? "good" : value === "WAIT_FOR_PULLBACK" ? "warn" : "neutral";
+    if (kind === "decision") return value === "ENTER" ? "good"
+      : (value === "WAIT_FOR_PULLBACK" || value === "ARMED") ? "warn" : "neutral";
     if (kind === "trend") {
       if (!value) return "neutral";
       if (value.includes("BULL")) return "good";
@@ -124,8 +125,14 @@
     // ---- hero: trading decision ----
     const dec = data.decision;
     const dv = el("decision-value");
-    dv.textContent = dec.permission.replaceAll("_", " ");
-    dv.className = "hero-value " + toneClass("decision", dec.permission);
+    // ARMED is a distinct pre-entry state (5-min bias qualified, 2-min setup
+    // still developing) layered on top of permission=NO_TRADE — see
+    // decision_engine.py's DecisionResult.armed docstring. Direction-tagged
+    // (ARMED LONG / ARMED SHORT) since "armed" alone is meaningless without
+    // knowing which side is being watched.
+    const displayLabel = dec.armed ? `ARMED ${dec.direction || ""}`.trim() : dec.permission.replaceAll("_", " ");
+    dv.textContent = displayLabel;
+    dv.className = "hero-value " + toneClass("decision", dec.armed ? "ARMED" : dec.permission);
     el("decision-sub").textContent = (dec.reasons && dec.reasons[dec.reasons.length - 1]) || "—";
 
     // ---- hero: entry score + checklist ----

@@ -120,6 +120,29 @@ check("SHORT: maxed + VERY_EXTENDED -> WAIT_FOR_PULLBACK", r11.permission == Ent
 
 
 # ============================================================
+print("\n=== armed: 5-min bias qualified, 2-min entry not yet scored ===")
+# ============================================================
+r12 = evaluate_decision(maxed_trend, weak_entry, GOOD_LOC("LONG"), cfg)
+check("strong trend + weak entry -> armed=True (watching for the 2-min setup)", r12.armed is True, str(r12.armed))
+check("...permission is still plain NO_TRADE (armed doesn't change permission)",
+      r12.permission == EntryPermission.NO_TRADE, str(r12.permission))
+check("...direction is still reported (LONG)", r12.direction == "LONG", str(r12.direction))
+check("...reasons explain ARMED", any("ARMED" in r for r in r12.reasons), str(r12.reasons))
+
+r13 = evaluate_decision(weak_trend, maxed_entry, GOOD_LOC("LONG"), cfg)
+check("weak trend + strong entry -> NOT armed (bias itself hasn't qualified yet)",
+      r13.armed is False, str(r13.armed))
+
+check("fully qualified + good location (ENTER) -> not armed (past the armed phase)",
+      r4.armed is False, str(r4.armed))
+check("fully qualified + bad location (WAIT_FOR_PULLBACK) -> not armed (different kind of waiting)",
+      r1.armed is False, str(r1.armed))
+
+check("SHORT side: strong trend + weak entry also arms (direction-tagged)",
+      evaluate_decision(maxed_short_trend, mk_entry("SHORT", 2), GOOD_LOC("SHORT"), cfg).armed is True)
+
+
+# ============================================================
 print("\n=== Every result always explains itself ===")
 # ============================================================
 for r in (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11):

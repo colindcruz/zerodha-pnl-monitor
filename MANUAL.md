@@ -690,6 +690,12 @@ equivalents) while you're at it.
   and Key Levels (VWAP, pivots, prev-day, opening range, nearest S/R); an Open Position
   card (with T1/T2/stop detail for long-option-owned positions); Trend Summary,
   Intraday Bias, Latest Signal, Upcoming Levels, and an Alerts feed.
+- Trading Decision shows **ARMED LONG**/**ARMED SHORT** as a distinct pre-entry state:
+  the 5-min Trend has qualified a direction but the 2-min Entry setup hasn't scored yet —
+  i.e. "bias established, watching the 2-min chart for a pullback." This sits underneath
+  the plain NO_TRADE permission (armed is a purely additive flag, doesn't change the
+  underlying ENTER/WAIT_FOR_PULLBACK/NO_TRADE decision) and is not to be confused with
+  WAIT_FOR_PULLBACK, which is a later, already-qualified-but-overextended state.
 - A TWAP-fallback flag appears next to Key Levels when VWAP couldn't be computed from
   real volume — NIFTY 50 itself is an index with no real traded volume, so VWAP is
   normally sourced from the current-month NIFTY futures contract instead (resolved
