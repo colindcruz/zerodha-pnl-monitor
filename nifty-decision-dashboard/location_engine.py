@@ -3,10 +3,10 @@ Location & Extension Engine. Pure: IndicatorSnapshot + candidate direction ->
 LocationResult. Two independent classifications:
 
   Extension — how far price has already travelled from its "fair value"
-  anchors (VWAP, EMA20), ATR-normalized: NORMAL / EXTENDED / VERY EXTENDED.
-  Uses the MORE distant of VWAP/EMA20 (max, not average) — a price that's
-  merely close to one of the two isn't "not extended," it needs to not be
-  far from either.
+  anchors (VWAP, EMA fast — IndicatorConfig.ema_fast_period), ATR-
+  normalized: NORMAL / EXTENDED / VERY EXTENDED. Uses the MORE distant of
+  the two (max, not average) — a price that's merely close to one of them
+  isn't "not extended," it needs to not be far from either.
 
   Runway/Location — direction-aware distance to the next S/R level versus
   the distance to the initial stop, i.e. the reward:stop ratio a trade
@@ -55,16 +55,16 @@ class LocationResult:
     insufficient_data: bool = False
 
 
-def _extension(price: float, vwap_v: Optional[float], ema20: Optional[float],
+def _extension(price: float, vwap_v: Optional[float], ema_fast: Optional[float], ema_fast_period: int,
                 atr_v: Optional[float], cfg: LocationEngineConfig) -> tuple[ExtensionLevel, Optional[float], str]:
-    if atr_v is None or atr_v == 0 or (vwap_v is None and ema20 is None):
+    if atr_v is None or atr_v == 0 or (vwap_v is None and ema_fast is None):
         return ExtensionLevel.NORMAL, None, "Extension: insufficient data (defaulting to NORMAL)"
 
     dists = []
     if vwap_v is not None:
         dists.append(abs(price - vwap_v))
-    if ema20 is not None:
-        dists.append(abs(price - ema20))
+    if ema_fast is not None:
+        dists.append(abs(price - ema_fast))
     atr_dist = max(dists) / atr_v
 
     if atr_dist >= cfg.extension_extended_atr:
@@ -73,7 +73,7 @@ def _extension(price: float, vwap_v: Optional[float], ema20: Optional[float],
         level = ExtensionLevel.EXTENDED
     else:
         level = ExtensionLevel.NORMAL
-    return level, atr_dist, f"Extension: {atr_dist:.2f} ATR from VWAP/EMA20 -> {level.value}"
+    return level, atr_dist, f"Extension: {atr_dist:.2f} ATR from VWAP/EMA{ema_fast_period} -> {level.value}"
 
 
 def _runway(price: float, direction: str, sr_levels, atr_v: Optional[float],
@@ -122,10 +122,10 @@ def evaluate_location(snapshot: IndicatorSnapshot, direction: str, cfg: Location
 
     price = tf.candles[-1]["close"]
     vwap_v = tf.vwap_value[-1]
-    ema20 = tf.ema_fast[-1]
+    ema_fast = tf.ema_fast[-1]
     atr_v = tf.atr[-1]
 
-    ext_level, ext_dist, ext_reason = _extension(price, vwap_v, ema20, atr_v, cfg)
+    ext_level, ext_dist, ext_reason = _extension(price, vwap_v, ema_fast, snapshot.config.ema_fast_period, atr_v, cfg)
     run_level, ratio, level_price, run_reason = _runway(price, direction, snapshot.sr_levels, atr_v, cfg)
 
     insufficient = ext_dist is None or atr_v is None

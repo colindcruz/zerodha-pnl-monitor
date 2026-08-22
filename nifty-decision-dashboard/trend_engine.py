@@ -1,7 +1,8 @@
 """
 Trend Engine (5-min). Pure: IndicatorSnapshot -> TrendResult. Combines five
-INDEPENDENT +-1 votes (Aroon, EMA20/50 structure, VWAP position+slope, DMI,
-price structure) into a -5..+5 score, which maps to a TrendDirection band.
+INDEPENDENT +-1 votes (Aroon, EMA fast/slow structure, VWAP position+slope,
+DMI, price structure) into a -5..+5 score, which maps to a TrendDirection
+band. EMA periods are IndicatorConfig.ema_fast_period/ema_slow_period.
 ADX explicitly does NOT vote here — it only feeds Trend Strength, a wholly
 separate classification of how convincingly the market is trending, not
 which way. A market can score STRONG BULL on direction while ADX still
@@ -20,10 +21,12 @@ Opening-Range Breakout (ORB) fallback: for roughly the first hour of every
 session (see config.py's orb_fallback_minutes), the 5-vote system above has
 no usable data yet — most of its indicators need far more bar history than
 exists that early. Rather than sit on NEUTRAL/insufficient_data through an
-obvious early move, evaluate_trend() substitutes a breakout read off the
-opening range during this window (_evaluate_orb()) — see TrendReadMode /
-TrendResult.mode, which tells the caller (and the UI) which method actually
-produced a given read.
+obvious early move, evaluate_trend() substitutes a breakout read during
+this window (_evaluate_orb()), measured against the SECOND 5-min candle's
+own high/low (see _orb_reference_range() — deliberately skipping the noisy
+first bar, a common ORB variant) — see TrendReadMode / TrendResult.mode,
+which tells the caller (and the UI) which method actually produced a given
+read.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from typing import Optional
 
 from candles import session_start
 from config import TrendEngineConfig
+from indicators import OpeningRange
 from snapshot import IndicatorSnapshot, TimeframeIndicators
 
 
@@ -105,17 +109,18 @@ def _vote_aroon(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> tuple[int, s
     return 0, f"Aroon: up {up:.0f} / down {down:.0f} not separated enough -> neutral"
 
 
-def _vote_ema_structure(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> tuple[int, str]:
+def _vote_ema_structure(tf: TimeframeIndicators, cfg: TrendEngineConfig,
+                         fast_period: int, slow_period: int) -> tuple[int, str]:
     fast, slow, atr_v = tf.ema_fast[-1], tf.ema_slow[-1], tf.atr[-1]
     if fast is None or slow is None or atr_v is None or atr_v == 0:
         return 0, "EMA structure: insufficient data"
     threshold = cfg.ema_structure_atr_threshold * atr_v
     diff = fast - slow
     if diff >= threshold:
-        return 1, f"EMA structure: EMA20 above EMA50 by {diff:.1f} -> bullish"
+        return 1, f"EMA structure: EMA{fast_period} above EMA{slow_period} by {diff:.1f} -> bullish"
     if -diff >= threshold:
-        return -1, f"EMA structure: EMA20 below EMA50 by {-diff:.1f} -> bearish"
-    return 0, "EMA structure: EMA20/50 too close -> neutral"
+        return -1, f"EMA structure: EMA{fast_period} below EMA{slow_period} by {-diff:.1f} -> bearish"
+    return 0, f"EMA structure: EMA{fast_period}/{slow_period} too close -> neutral"
 
 
 def _vote_vwap(tf: TimeframeIndicators, cfg: TrendEngineConfig) -> tuple[int, str]:
@@ -260,13 +265,32 @@ def _elapsed_session_minutes(snapshot: IndicatorSnapshot) -> Optional[float]:
     return (last_date - session_start(last_date)).total_seconds() / 60
 
 
+def _orb_reference_range(snapshot: IndicatorSnapshot):
+    """The ORB fallback's own reference range: the high/low of the SECOND
+    5-min candle (tf5.candles[1], i.e. 09:20-09:25 IST), deliberately
+    skipping the first 5-min candle (09:15-09:20) — the opening print tends
+    to carry the pre-market order-imbalance settling out and is often the
+    single noisiest bar of the day, so anchoring the breakout range to the
+    bar right after it is a common ORB variant meant to avoid that.
+
+    Deliberately NOT the same thing as IndicatorConfig.opening_range_minutes
+    (the 15-minute window key_levels.py's "Opening Range High/Low" shows) —
+    that's a separate, general-purpose concept used elsewhere on the
+    dashboard; this one is specific to the ORB fallback only. Returns None
+    until that second 5-min candle has actually closed (the first ~10
+    minutes of the session), in which case evaluate_trend() falls through
+    to the standard path, same as it always has."""
+    candles = snapshot.tf5.candles
+    if len(candles) < 2:
+        return None
+    second = candles[1]
+    return OpeningRange(high=second["high"], low=second["low"])
+
+
 def _evaluate_orb(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig) -> Optional[TrendResult]:
-    """Opening-range breakout read — see module docstring. Returns None if
-    the opening range itself hasn't formed yet (the first
-    IndicatorConfig.opening_range_minutes of the session), in which case
-    evaluate_trend() falls through to the standard path, which will just
-    honestly read NEUTRAL/insufficient_data as it always has."""
-    orange = snapshot.opening_range
+    """Opening-range breakout read — see module docstring and
+    _orb_reference_range()."""
+    orange = _orb_reference_range(snapshot)
     if orange is None or not snapshot.candles_1m:
         return None
     or_width = orange.high - orange.low
@@ -275,11 +299,11 @@ def _evaluate_orb(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig) -> Option
 
     price = snapshot.candles_1m[-1]["close"]
     if price > orange.high:
-        sign, distance, edge_desc = 1, price - orange.high, f"above OR high ({orange.high:.1f})"
+        sign, distance, edge_desc = 1, price - orange.high, f"above the 2nd 5-min candle's high ({orange.high:.1f})"
     elif price < orange.low:
-        sign, distance, edge_desc = -1, orange.low - price, f"below OR low ({orange.low:.1f})"
+        sign, distance, edge_desc = -1, orange.low - price, f"below the 2nd 5-min candle's low ({orange.low:.1f})"
     else:
-        sign, distance, edge_desc = 0, 0.0, f"still inside the opening range ({orange.low:.1f}-{orange.high:.1f})"
+        sign, distance, edge_desc = 0, 0.0, f"still inside the 2nd 5-min candle's range ({orange.low:.1f}-{orange.high:.1f})"
 
     ratio = distance / or_width
     if sign == 0 or ratio <= cfg.orb_weak_ratio:
@@ -318,7 +342,8 @@ def evaluate_trend(snapshot: IndicatorSnapshot, cfg: TrendEngineConfig = None) -
     reasons = []
     for name, fn in (
         ("aroon", lambda: _vote_aroon(tf, cfg)),
-        ("ema_structure", lambda: _vote_ema_structure(tf, cfg)),
+        ("ema_structure", lambda: _vote_ema_structure(tf, cfg, snapshot.config.ema_fast_period,
+                                                       snapshot.config.ema_slow_period)),
         ("vwap", lambda: _vote_vwap(tf, cfg)),
         ("dmi", lambda: _vote_dmi(tf, cfg)),
         ("price_structure", lambda: _vote_price_structure(snapshot)),

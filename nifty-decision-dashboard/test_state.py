@@ -30,6 +30,21 @@ def check(label: str, condition: bool, detail: str = ""):
         failures.append(label)
 
 
+# ============================================================
+print("=== DashboardState._prev_5min_close ===")
+# ============================================================
+from snapshot import build_snapshot  # noqa: E402
+
+_icfg = default_config()
+_one_bar_snap = build_snapshot(candles_from_closes(steady_trend(24000, 1.0, 5)), _icfg)  # 1 tf5 bar only
+check("only 1 tf5 bar -> prev_5min_close is None", DashboardState._prev_5min_close(_one_bar_snap) is None)
+
+_two_bar_candles = candles_from_closes([24000.0] * 5 + [24010.0] * 5)  # bar1 closes 24000, bar2 closes 24010
+_two_bar_snap = build_snapshot(_two_bar_candles, _icfg)
+check("2 tf5 bars -> prev_5min_close is the FIRST (completed) bar's close, not the current one",
+      DashboardState._prev_5min_close(_two_bar_snap) == 24000.0, str(DashboardState._prev_5min_close(_two_bar_snap)))
+
+
 class FakeKite:
     def __init__(self, one_min_candles, prev_day_candles, positions_sequence, spot_token=256265):
         self.spot_token = spot_token
@@ -137,6 +152,8 @@ with tempfile.TemporaryDirectory() as d:
     check("trend_age_bars advances on a new bar", result3b["trend_age_bars"] >= 1, str(result3b["trend_age_bars"]))
     check("vote_persistence populated once a bar has closed", bool(result3b["vote_persistence"]),
           str(result3b["vote_persistence"]))
+    check("prev_5min_close is populated once enough bars exist", result3b["prev_5min_close"] is not None,
+          str(result3b["prev_5min_close"]))
 
     trade_lines = trade_log.read_text().strip().split("\n") if trade_log.exists() else []
     check("ENTRY_DETECTED logged to the trade log", len(trade_lines) == 1, str(trade_lines))

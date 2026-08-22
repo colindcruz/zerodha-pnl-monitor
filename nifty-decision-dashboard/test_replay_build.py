@@ -119,8 +119,10 @@ with tempfile.TemporaryDirectory() as d:
           str(len(snapshots)))
 
     first, last = snapshots[0], snapshots[-1]
-    check("first snapshot's ts is the first 5-min bar (09:19, the 5th one-min candle)",
-          first["ts"].startswith("2026-08-21T09:19"), first["ts"])
+    check("first snapshot's ts is the first bar's OWN START time (09:15), not its last constituent candle (09:19)",
+          first["ts"].startswith("2026-08-21T09:15"), first["ts"])
+    check("second snapshot's ts is that bar's start time (09:20)", snapshots[1]["ts"].startswith("2026-08-21T09:20"),
+          snapshots[1]["ts"])
     check("tick_seq increments monotonically across the whole replay",
           [s["tick_seq"] for s in snapshots] == list(range(1, expected_bars + 1)),
           str([s["tick_seq"] for s in snapshots[:5]]))

@@ -10,6 +10,10 @@
 
   const fmtPts = (v) => v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(1);
   const fmtPrice = (v) => v == null ? "—" : v.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  // Rounded to the nearest integer — used only for the header's NIFTY spot
+  // display, which is colored green/red/white against the previous 5-min
+  // bar's close (see render()) rather than showing decimal precision.
+  const fmtSpotInt = (v) => v == null ? "—" : Math.round(v).toLocaleString("en-IN");
   const fmtTime = (iso) => {
     if (!iso) return "—";
     return new Date(iso).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
@@ -70,6 +74,17 @@
 
   function render(data) {
     if (!data || !data.decision) return;
+
+    // ---- header: NIFTY spot (green above / red below / white equal to the
+    // previous 5-min bar's close) ----
+    const spotEl = el("header-spot-value");
+    spotEl.textContent = fmtSpotInt(data.spot);
+    const prevClose = data.prev_5min_close;
+    let spotTone = "same";
+    if (data.spot != null && prevClose != null) {
+      spotTone = data.spot > prevClose ? "up" : data.spot < prevClose ? "down" : "same";
+    }
+    spotEl.className = "v " + spotTone;
 
     // ---- hero: market state ----
     const t = data.trend || {};
@@ -137,9 +152,10 @@
     const trendRows = [
       { name: "Aroon (14)", vote: t.votes && t.votes.aroon,
         detail: `${fmtNum(td.aroon_up)} / ${fmtNum(td.aroon_down)}${persistLabel("aroon")}` },
-      { name: "EMA 20/50", vote: t.votes && t.votes.ema_structure,
+      { name: `EMA ${td.ema_fast_period ?? "?"}/${td.ema_slow_period ?? "?"}`, vote: t.votes && t.votes.ema_structure,
         detail: (td.ema_fast != null && td.ema_slow != null)
-          ? `EMA20 ${td.ema_fast > td.ema_slow ? "&gt;" : "&lt;"} EMA50 (${fmtPrice(td.ema_fast)} / ${fmtPrice(td.ema_slow)})`
+          ? `EMA${td.ema_fast_period ?? "?"} ${td.ema_fast > td.ema_slow ? "&gt;" : "&lt;"} EMA${td.ema_slow_period ?? "?"} `
+            + `(${fmtPrice(td.ema_fast)} / ${fmtPrice(td.ema_slow)})`
           : "—" },
       { name: "VWAP", vote: t.votes && t.votes.vwap,
         detail: `Distance: ${fmtPts(td.vwap_distance_points)} pts` },
@@ -170,7 +186,8 @@
     const locRows = [
       ["Price vs VWAP", `${fmtPts(td.vwap_distance_points)} pts`],
       ["VWAP Distance %", td.vwap != null && td.vwap ? `${(Math.abs(td.vwap_distance_points) / td.vwap * 100).toFixed(2)}%` : "—"],
-      ["Distance from EMA20", (td.ema_fast != null && data.spot != null) ? `${fmtPts(data.spot - td.ema_fast)} pts` : "—"],
+      [`Distance from EMA${td.ema_fast_period ?? "?"}`,
+        (td.ema_fast != null && data.spot != null) ? `${fmtPts(data.spot - td.ema_fast)} pts` : "—"],
       ["5-Min ATR", td.atr != null ? `${td.atr.toFixed(1)} pts` : "—"],
       ["Extension Status", loc.extension || "—"],
       ["Trend Age", `${data.trend_age_bars != null ? data.trend_age_bars : "—"} bars`],

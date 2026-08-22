@@ -262,11 +262,15 @@ class DashboardState:
     @staticmethod
     def _trend_detail(snapshot) -> dict:
         """Raw indicator numbers behind the Trend Engine's votes (Aroon
-        up/down, EMA20/50, VWAP distance, DI+/-, ADX, ATR, price structure
-        label) — the engines themselves only return the +-1 vote and a
-        human sentence (see trend_engine.py's TrendResult); this is a
+        up/down, EMA fast/slow, VWAP distance, DI+/-, ADX, ATR, price
+        structure label) — the engines themselves only return the +-1 vote
+        and a human sentence (see trend_engine.py's TrendResult); this is a
         UI-serving bundle assembled straight from the same snapshot, not a
-        change to the engine's own pure return type."""
+        change to the engine's own pure return type. Includes the actual
+        configured ema_fast_period/ema_slow_period (not just their values)
+        so the UI can label them correctly (e.g. "EMA9"/"EMA21") without
+        hard-coding a period number that goes stale the next time
+        config.py's periods are retuned."""
         tf = snapshot.tf5
         price = tf.candles[-1]["close"] if tf.candles else None
         vwap_v = tf.vwap_value[-1]
@@ -275,6 +279,7 @@ class DashboardState:
         return {
             "aroon_up": tf.aroon.up[-1], "aroon_down": tf.aroon.down[-1],
             "ema_fast": tf.ema_fast[-1], "ema_slow": tf.ema_slow[-1],
+            "ema_fast_period": snapshot.config.ema_fast_period, "ema_slow_period": snapshot.config.ema_slow_period,
             "vwap": vwap_v,
             "vwap_distance_points": (price - vwap_v) if (price is not None and vwap_v is not None) else None,
             "plus_di": tf.dmi_adx.plus_di[-1], "minus_di": tf.dmi_adx.minus_di[-1], "adx": tf.dmi_adx.adx[-1],
@@ -290,6 +295,17 @@ class DashboardState:
                              key=lambda lv: abs(lv.distance_points))
         return [{"name": lv.name, "price": lv.price, "distance_points": lv.distance_points}
                 for lv in candidates[:limit]]
+
+    @staticmethod
+    def _prev_5min_close(snapshot) -> Optional[float]:
+        """The close of the previous COMPLETED 5-min bar (tf5.candles[-2]) —
+        tf5.candles[-1] is the current, still-forming bar, so comparing
+        live spot against it would mostly just compare a bar's own price to
+        itself. None until a second 5-min bar exists (first ~5-10 minutes
+        of the session) — used by the UI to color the header's NIFTY spot
+        green/red/white vs. five minutes ago."""
+        candles = snapshot.tf5.candles
+        return candles[-2]["close"] if len(candles) >= 2 else None
 
     # -- recompute -----------------------------------------------------------
 
@@ -353,6 +369,7 @@ class DashboardState:
         recent_events = self.event_feed.recent(20)
         self.latest = {
             "ts": now.isoformat(), "tick_seq": self.tick_seq, "spot": spot,
+            "prev_5min_close": self._prev_5min_close(snapshot),
             "trend": asdict(trend), "entry": asdict(entry), "location": asdict(location),
             "decision": asdict(decision), "key_levels": asdict(key_levels),
             "vwap_is_twap_fallback": vwap_is_twap,

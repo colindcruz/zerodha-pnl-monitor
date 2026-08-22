@@ -39,7 +39,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect
 
-from candles import IST, normalize_historical
+from candles import IST, bucket_start, normalize_historical
 from config import DashboardConfig
 from key_levels import PrevDayOHLC
 from state import DashboardState
@@ -147,7 +147,13 @@ def build_replay(replay_date: date, kite=None) -> Path:
     snapshots = []
     for i in range(BARS_PER_STEP, len(candles) + 1, BARS_PER_STEP):
         state.accumulator.seed_from_historical(candles[:i])
-        step_time = candles[i - 1]["date"]
+        # Label the snapshot by the bar's OWN start time (e.g. 09:15 for the
+        # first bar), not the last 1-min candle that completed it (09:19) —
+        # candles are conventionally identified by when they open, and
+        # that's also how tf5.candles are already keyed internally (see
+        # candles.bucket_candles), so this just makes the displayed/logged
+        # timestamp match the bucket the rest of the system already uses.
+        step_time = bucket_start(candles[i - 1]["date"], BARS_PER_STEP)
         snapshots.append(state.recompute(step_time))
 
     REPLAY_DATA_DIR.mkdir(parents=True, exist_ok=True)

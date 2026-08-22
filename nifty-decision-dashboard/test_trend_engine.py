@@ -155,23 +155,29 @@ check("wide-then-narrow session: volatility reads LOW",
 
 
 # ============================================================
-print("\n=== Opening-Range Breakout (ORB) fallback ===")
+print("\n=== Opening-Range Breakout (ORB) fallback (2nd 5-min candle) ===")
 # ============================================================
 from datetime import timedelta  # noqa: E402
 
 
-def or_forming_bars(low=24000.0, high=24020.0, minutes=16):
-    """First `minutes` one-min bars oscillating between low/high, tight
-    wiggle so the resulting opening_range() high/low stay close to the
-    given bounds without needing exact-arithmetic assumptions about it."""
-    closes = [low if i % 2 == 0 else high for i in range(minutes)]
-    return candles_from_closes(closes, wiggle=0.1)
+def two_candle_setup(ref_low=24000.0, ref_high=24020.0, first_low=23990.0, first_high=24030.0):
+    """First 5-min candle (minutes 0-4) with a DELIBERATELY WIDER/different
+    range than the reference bars — if the ORB fallback accidentally used
+    this bar instead of the second one, the breakout-ratio math below
+    would come out wrong, making a same-first-and-second-candle test too
+    weak to actually catch that bug. Second 5-min candle (minutes 5-9)
+    carries the controlled range that becomes the ORB reference range."""
+    first = candles_from_closes([first_low if i % 2 == 0 else first_high for i in range(5)], wiggle=0.1)
+    second_start = first[-1]["date"] + timedelta(minutes=1)
+    second = candles_from_closes([ref_low if i % 2 == 0 else ref_high for i in range(5)],
+                                  start=second_start, wiggle=0.1)
+    return first + second
 
 
-def orb_snapshot(breakout_price, elapsed_minutes, or_low=24000.0, or_high=24020.0):
-    """OR-forming bars, then a flat run of 1-min bars at `breakout_price`
-    until the session has `elapsed_minutes` of history."""
-    bars = or_forming_bars(or_low, or_high)
+def orb_snapshot(breakout_price, elapsed_minutes, ref_low=24000.0, ref_high=24020.0):
+    """The two-candle setup, then a flat run of 1-min bars at
+    `breakout_price` until the session has `elapsed_minutes` of history."""
+    bars = two_candle_setup(ref_low, ref_high)
     remaining = elapsed_minutes - len(bars)
     if remaining > 0:
         extra_start = bars[-1]["date"] + timedelta(minutes=1)
@@ -179,59 +185,73 @@ def orb_snapshot(breakout_price, elapsed_minutes, or_low=24000.0, or_high=24020.
     return build_snapshot(bars, icfg)
 
 
-# First, learn the ACTUAL opening range these fixtures produce (real high/
-# low from the real opening_range() function, not an assumed exact value —
-# same "derive expected from the real function" approach used for the
-# volatility tests above), so every breakout offset below is computed from
-# real numbers instead of a brittle assumed width.
-or_probe_snap = build_snapshot(or_forming_bars(), icfg)
-or_low, or_high = or_probe_snap.opening_range.low, or_probe_snap.opening_range.high
+# First, learn the ACTUAL reference range these fixtures produce (real
+# high/low from the real _orb_reference_range() function, not an assumed
+# exact value — same "derive expected from the real function" approach
+# used for the volatility tests above), so every breakout offset below is
+# computed from real numbers instead of a brittle assumed width.
+from trend_engine import _orb_reference_range  # noqa: E402
+
+or_probe_snap = build_snapshot(two_candle_setup(), icfg)
+probe_range = _orb_reference_range(or_probe_snap)
+check("reference-range probe formed (2 tf5 bars exist)", probe_range is not None)
+or_low, or_high = probe_range.low, probe_range.high
 or_width = or_high - or_low
-check("opening range probe formed with a positive width", or_width > 0, str(or_width))
+check("reference range formed with a positive width", or_width > 0, str(or_width))
+check("reference range comes from the SECOND 5-min candle, not the wider first one",
+      or_high < 24030.0 and or_low > 23990.0, f"low={or_low} high={or_high}")
+
+# Not enough bars yet for even the reference range to exist (only 1 tf5 bar
+# so far) -> falls through to the standard path.
+too_early_bars = candles_from_closes([24000.0, 24005.0, 24010.0, 24005.0, 24000.0], wiggle=0.1)
+too_early_snap = build_snapshot(too_early_bars, icfg)
+check("fewer than 2 tf5 bars -> _orb_reference_range is None", _orb_reference_range(too_early_snap) is None)
+check("fewer than 2 tf5 bars -> evaluate_trend falls through to STANDARD",
+      evaluate_trend(too_early_snap, tcfg).mode == TrendReadMode.STANDARD)
 
 # Still inside the range -> NEUTRAL, ORB mode.
-inside_result = evaluate_trend(orb_snapshot(or_low + or_width / 2, elapsed_minutes=25, or_low=or_low, or_high=or_high), tcfg)
+inside_result = evaluate_trend(orb_snapshot(or_low + or_width / 2, elapsed_minutes=25, ref_low=or_low, ref_high=or_high), tcfg)
 check("ORB, price still inside the range: NEUTRAL", inside_result.direction == TrendDirection.NEUTRAL,
       str(inside_result.direction))
 check("ORB mode flagged on the result", inside_result.mode == TrendReadMode.OPENING_RANGE_BREAKOUT, str(inside_result.mode))
 check("ORB mode: votes dict is empty (not vote-based)", inside_result.votes == {}, str(inside_result.votes))
 check("ORB mode: insufficient_data is True (momentum has no ORB equivalent)", inside_result.insufficient_data is True)
 
-# Weak breakout: 25% of the OR's own width beyond the high.
-weak_result = evaluate_trend(orb_snapshot(or_high + or_width * 0.25, elapsed_minutes=25, or_low=or_low, or_high=or_high), tcfg)
-check("ORB, weak breakout (0.25x OR width above high): WEAK_BULL", weak_result.direction == TrendDirection.WEAK_BULL,
+# Weak breakout: 25% of the reference range's own width beyond the high.
+weak_result = evaluate_trend(orb_snapshot(or_high + or_width * 0.25, elapsed_minutes=25, ref_low=or_low, ref_high=or_high), tcfg)
+check("ORB, weak breakout (0.25x width above high): WEAK_BULL", weak_result.direction == TrendDirection.WEAK_BULL,
       str(weak_result.direction))
 
-# Moderate breakout: 75% of the OR's own width beyond the high.
-moderate_result = evaluate_trend(orb_snapshot(or_high + or_width * 0.75, elapsed_minutes=25, or_low=or_low, or_high=or_high), tcfg)
-check("ORB, moderate breakout (0.75x OR width above high): BULL", moderate_result.direction == TrendDirection.BULL,
+# Moderate breakout: 75% of the reference range's own width beyond the high.
+moderate_result = evaluate_trend(orb_snapshot(or_high + or_width * 0.75, elapsed_minutes=25, ref_low=or_low, ref_high=or_high), tcfg)
+check("ORB, moderate breakout (0.75x width above high): BULL", moderate_result.direction == TrendDirection.BULL,
       str(moderate_result.direction))
 
-# Strong breakout: a full 1.5x the OR's own width beyond the high.
-strong_result = evaluate_trend(orb_snapshot(or_high + or_width * 1.5, elapsed_minutes=25, or_low=or_low, or_high=or_high), tcfg)
-check("ORB, strong breakout (1.5x OR width above high): STRONG_BULL", strong_result.direction == TrendDirection.STRONG_BULL,
+# Strong breakout: a full 1.5x the reference range's own width beyond the high.
+strong_result = evaluate_trend(orb_snapshot(or_high + or_width * 1.5, elapsed_minutes=25, ref_low=or_low, ref_high=or_high), tcfg)
+check("ORB, strong breakout (1.5x width above high): STRONG_BULL", strong_result.direction == TrendDirection.STRONG_BULL,
       str(strong_result.direction))
 
-# Mirror image below the OR low.
-bear_result = evaluate_trend(orb_snapshot(or_low - or_width * 1.5, elapsed_minutes=25, or_low=or_low, or_high=or_high), tcfg)
-check("ORB, strong breakdown (1.5x OR width below low): STRONG_BEAR", bear_result.direction == TrendDirection.STRONG_BEAR,
+# Mirror image below the reference range's low.
+bear_result = evaluate_trend(orb_snapshot(or_low - or_width * 1.5, elapsed_minutes=25, ref_low=or_low, ref_high=or_high), tcfg)
+check("ORB, strong breakdown (1.5x width below low): STRONG_BEAR", bear_result.direction == TrendDirection.STRONG_BEAR,
       str(bear_result.direction))
 
 # Past the ORB fallback window (elapsed >= orb_fallback_minutes=60) ->
-# standard mode is used again, regardless of price vs. the (long-stale) OR.
+# standard mode is used again, regardless of price vs. the (long-stale) range.
 late_result = evaluate_trend(
-    orb_snapshot(or_high + or_width * 1.5, elapsed_minutes=tcfg.orb_fallback_minutes + 5, or_low=or_low, or_high=or_high),
+    orb_snapshot(or_high + or_width * 1.5, elapsed_minutes=tcfg.orb_fallback_minutes + 5, ref_low=or_low, ref_high=or_high),
     tcfg,
 )
 check("past the ORB window: mode reverts to STANDARD", late_result.mode == TrendReadMode.STANDARD, str(late_result.mode))
 
-# A perfectly flat opening range (zero width) must not raise (would be a
+# A perfectly flat reference range (zero width) must not raise (would be a
 # ZeroDivisionError without the or_width<=0 guard) — falls through to the
-# standard path instead, same as if the OR hadn't formed at all.
-flat_or_bars = candles_from_closes([24000.0] * 16, wiggle=0)
-flat_or_snap = build_snapshot(flat_or_bars, icfg)
-check("degenerate zero-width opening range does not raise",
-      evaluate_trend(flat_or_snap, tcfg).mode == TrendReadMode.STANDARD)
+# standard path instead, same as if the reference range hadn't formed yet.
+flat_bars = candles_from_closes([24000.0] * 10, wiggle=0)
+flat_snap = build_snapshot(flat_bars, icfg)
+check("degenerate zero-width reference range does not raise",
+      evaluate_trend(flat_snap, tcfg).mode == TrendReadMode.STANDARD)
 
 
 # ============================================================

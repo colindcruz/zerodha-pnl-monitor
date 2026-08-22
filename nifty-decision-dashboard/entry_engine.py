@@ -1,6 +1,6 @@
 """
 Entry Engine (2-min). Pure: IndicatorSnapshot + candidate direction ->
-EntryResult. A 0-5 point pullback-reversal setup score: EMA20 slope,
+EntryResult. A 0-5 point pullback-reversal setup score: EMA fast slope,
 proximity to the 8-bar extreme, wick-reversal quality, candle close
 location, confirmation candle — each worth at most 1 point.
 
@@ -77,7 +77,7 @@ def evaluate_entry(snapshot: IndicatorSnapshot, direction: str, cfg: EntryEngine
     components = {}
     reasons = []
 
-    # 1. EMA20 slope, in the setup's favor, over the signal bar.
+    # 1. EMA fast slope, in the setup's favor, over the signal bar.
     lookback = cfg.ema_slope_lookback_bars
     prior_idx = signal_idx - lookback
     ema_now = tf.ema_fast[signal_idx]
@@ -87,7 +87,8 @@ def evaluate_entry(snapshot: IndicatorSnapshot, direction: str, cfg: EntryEngine
         sign = 1 if direction == "LONG" else -1
         slope_ok = sign * (ema_now - ema_before) >= cfg.ema_slope_atr_threshold * atr_v
     components["ema_slope"] = 1 if slope_ok else 0
-    reasons.append(f"EMA20 slope {'favorable' if slope_ok else 'not favorable'} for {direction}")
+    reasons.append(f"EMA{snapshot.config.ema_fast_period} slope {'favorable' if slope_ok else 'not favorable'} "
+                    f"for {direction}")
 
     # 2. Proximity to the 8-bar extreme (the pullback level being bought/sold).
     lb = cfg.extreme_lookback_bars

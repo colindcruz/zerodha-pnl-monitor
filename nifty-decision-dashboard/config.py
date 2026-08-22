@@ -21,8 +21,16 @@ class IndicatorConfig:
     engine's own candle series (built at its own timeframe) is what actually
     differs, not the period counts applied to that series."""
 
-    ema_fast_period: int = 20
-    ema_slow_period: int = 50
+    # 9/21 — a standard scalping EMA pair, not the more common swing-trading
+    # 20/50 — chosen specifically to warm up faster on 5-min bars (45/105
+    # min vs. 100/250 min), closing most of the gap to when the ORB
+    # fallback's own window ends (60 min; see TrendEngineConfig). Every
+    # place that describes these in a message to the user reads the actual
+    # configured periods back out (snapshot.config.ema_fast_period/
+    # ema_slow_period) rather than hard-coding "20"/"50", so retuning this
+    # again later doesn't leave stale numbers anywhere.
+    ema_fast_period: int = 9
+    ema_slow_period: int = 21
     atr_period: int = 14
     aroon_period: int = 14
     dmi_period: int = 14         # Wilder-smoothed DI+/DI-/ADX, all share this period
@@ -44,10 +52,12 @@ class IndicatorConfig:
 
 @dataclass
 class TrendEngineConfig:
-    """5-minute Trend Engine. Five independent ±1 votes (Aroon, EMA20/50
-    structure, VWAP position+slope, DMI, price structure) sum to a -5..+5
-    score; ADX does NOT vote — it only feeds Trend Strength, a separate
-    classification. See trend_engine.py's module docstring for why."""
+    """5-minute Trend Engine. Five independent ±1 votes (Aroon, EMA
+    fast/slow structure, VWAP position+slope, DMI, price structure) sum to
+    a -5..+5 score; ADX does NOT vote — it only feeds Trend Strength, a
+    separate classification. See trend_engine.py's module docstring for
+    why. EMA periods themselves live in IndicatorConfig (ema_fast_period/
+    ema_slow_period), shared with the Entry Engine."""
 
     # Score -> TrendDirection band edges (symmetric around 0).
     strong_band: int = 4     # |score| >= 4 -> STRONG BULL/BEAR
@@ -66,8 +76,8 @@ class TrendEngineConfig:
     # Aroon vote: Aroon-Up/Aroon-Down separation needed to count as directional.
     aroon_min_separation: float = 20.0
 
-    # EMA20/50 structure vote: EMA20 above/below EMA50 by at least this many
-    # ATRs, to avoid voting on a near-flat cross.
+    # EMA fast/slow structure vote: EMA fast above/below EMA slow by at
+    # least this many ATRs, to avoid voting on a near-flat cross.
     ema_structure_atr_threshold: float = 0.05
 
     # Trend Strength (ADX-based, independent classification, does not feed the
@@ -102,34 +112,37 @@ class TrendEngineConfig:
     # Opening-Range Breakout fallback: the standard 5-vote system needs
     # ~70+ minutes of 5-min-bar history before ANY vote can compute at all
     # (Aroon/DMI need aroon_period/dmi_period bars; EMA structure needs
-    # EMA50, far longer still) — for roughly the first hour of every
-    # session it would otherwise read NEUTRAL/insufficient_data throughout,
-    # even against an obvious early move. During this window,
-    # direction/score are instead derived from a simple opening-range
-    # breakout read: how far price has moved past the OR's own high/low,
-    # in units of the OR's own width (see trend_engine.py's
-    # _evaluate_orb()). Momentum/Volatility/ADX-direction are NOT
-    # substituted — they stay honestly "insufficient data" during this
-    # window, since ORB has no equivalent read for those. Assumes
-    # orb_fallback_minutes > IndicatorConfig.opening_range_minutes (the OR
-    # itself must have already formed) — true for the defaults (60 > 15).
+    # ema_slow_period bars, longer still) — for roughly the first hour of
+    # every session it would otherwise read NEUTRAL/insufficient_data
+    # throughout, even against an obvious early move. During this window,
+    # direction/score are instead derived from a breakout read: how far
+    # price has moved past the reference range's own high/low, in units of
+    # that range's own width (see trend_engine.py's _evaluate_orb()). The
+    # reference range is the SECOND 5-min candle's own high/low (not the
+    # first — see _orb_reference_range()'s docstring for why — and NOT
+    # IndicatorConfig.opening_range_minutes's 15-minute window, a separate
+    # concept used elsewhere on the dashboard). Momentum/Volatility/ADX-
+    # direction are NOT substituted — they stay honestly "insufficient
+    # data" during this window, since ORB has no equivalent read for those.
     orb_fallback_minutes: int = 60
-    orb_weak_ratio: float = 0.0      # any close beyond OR high/low at all -> at least WEAK
-    orb_moderate_ratio: float = 0.5   # beyond by 50% of the OR's own width -> BULL/BEAR
-    orb_strong_ratio: float = 1.0     # beyond by a full OR-width -> STRONG_BULL/STRONG_BEAR
+    orb_weak_ratio: float = 0.0      # any close beyond the reference range at all -> at least WEAK
+    orb_moderate_ratio: float = 0.5   # beyond by 50% of the reference range's own width -> BULL/BEAR
+    orb_strong_ratio: float = 1.0     # beyond by a full reference-range width -> STRONG_BULL/STRONG_BEAR
 
 
 @dataclass
 class EntryEngineConfig:
-    """2-minute Entry Engine. 0-5 point score: EMA20 slope, proximity to 8-bar
-    extreme, wick-reversal quality, candle close location, confirmation
-    candle. Each sub-score contributes at most 1 point."""
+    """2-minute Entry Engine. 0-5 point score: EMA fast slope, proximity to
+    8-bar extreme, wick-reversal quality, candle close location,
+    confirmation candle. Each sub-score contributes at most 1 point. The
+    EMA period itself is IndicatorConfig.ema_fast_period, shared with the
+    Trend Engine."""
 
     extreme_lookback_bars: int = 8
     proximity_atr_threshold: float = 0.3   # within this many ATRs of the 8-bar extreme
 
     ema_slope_lookback_bars: int = 2
-    ema_slope_atr_threshold: float = 0.05  # EMA20 must have moved at least this many ATRs
+    ema_slope_atr_threshold: float = 0.05  # EMA fast must have moved at least this many ATRs
 
     # Wick-reversal quality: opposite-direction wick must be at least this
     # fraction of the candle's total range to count as a genuine rejection wick.
@@ -156,8 +169,8 @@ class EntryEngineConfig:
 @dataclass
 class LocationEngineConfig:
     """Location & Extension Engine. Extension: ATR-normalized distance to
-    VWAP/EMA20. Runway/Location: direction-aware distance to the next S/R
-    level plus reward-vs-stop ratio."""
+    VWAP/EMA fast. Runway/Location: direction-aware distance to the next
+    S/R level plus reward-vs-stop ratio."""
 
     extension_normal_atr: float = 1.0        # < this -> NORMAL
     extension_extended_atr: float = 2.0       # < this (and >= normal) -> EXTENDED; >= this -> VERY EXTENDED

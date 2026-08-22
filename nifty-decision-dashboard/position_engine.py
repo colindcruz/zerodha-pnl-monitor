@@ -153,13 +153,14 @@ def _score_deterioration(snapshot: IndicatorSnapshot, direction: str, cfg: Posit
             signals["vwap"] = w["vwap"]
             reasons.append(f"Price is on the unfavorable side of VWAP ({price:.1f} vs {vwap_v:.1f})")
 
-    # 4. EMA structure: EMA20 has crossed to the unfavorable side of EMA50.
+    # 4. EMA structure: EMA fast has crossed to the unfavorable side of EMA slow.
     fast, slow = tf.ema_fast[-1], tf.ema_slow[-1]
     if fast is not None and slow is not None:
         bad = (direction == "LONG" and fast < slow) or (direction == "SHORT" and fast > slow)
         if bad:
             signals["ema_structure"] = w["ema_structure"]
-            reasons.append("EMA20 has crossed to the unfavorable side of EMA50")
+            reasons.append(f"EMA{snapshot.config.ema_fast_period} has crossed to the unfavorable side "
+                            f"of EMA{snapshot.config.ema_slow_period}")
 
     # 5. DMI: the unfavorable DI now dominates.
     pdi, mdi = tf.dmi_adx.plus_di[-1], tf.dmi_adx.minus_di[-1]
